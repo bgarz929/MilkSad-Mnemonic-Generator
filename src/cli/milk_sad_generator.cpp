@@ -1,13 +1,5 @@
 #include <iostream>
-#include <fstream>
-#include <random>
-#include <vector>
-#include <string>
-#include <iomanip>
-#include <signal.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <sstream>
+
 #include <ctime>
 #include <cmath>
 #include <stdexcept>
