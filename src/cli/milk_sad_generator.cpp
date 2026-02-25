@@ -218,7 +218,7 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
     // -i - : read from stdin
     // -t priv : input is hex private keys
     // -x : output format hex
-    std::string cmd = "./brainflayer/brainflayer -v -b ./040823BF.blf -i - -t priv -x > brainflayer_found_" + std::to_string(thread_id) + ".txt 2>&1";
+    std::string cmd = "./brainflayer/brainflayer -v -b ./040823BF.blf -t priv -x > brainflayer_found_" + std::to_string(thread_id) + ".txt 2>&1";
     
     FILE* pipe = popen(cmd.c_str(), "w");
     if (!pipe) {
