@@ -21,6 +21,8 @@
 #include <mutex>
 #include <chrono>
 #include <cstdio>
+#include <cstring>   // for strerror
+#include <cerrno>
 
 // Configuration
 const std::string WORDLIST_DIR = "./Wordlist/";
@@ -48,7 +50,7 @@ void signal_handler(int) {
     std::cout << "\nInterrupt received. Saving progress..." << std::endl;
 }
 
-// Helper functions (unchanged)
+// Helper functions
 std::string remove_whitespace(const std::string& str) {
     std::string result = str;
     result.erase(std::remove_if(result.begin(), result.end(), ::isspace), result.end());
@@ -253,6 +255,12 @@ void worker(uint32_t start, uint32_t end, int thread_id,
             const std::vector<std::string>& wordlist,
             std::atomic<uint64_t>& total_processed,
             std::mutex& cout_mutex) {
+    // Log thread start
+    {
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        std::cout << "Thread " << thread_id << " starting: range [" << start << ", " << end << "]" << std::endl;
+    }
+
     std::string progress_file = "progress_thread_" + std::to_string(thread_id) + ".bin";
     uint32_t current = load_progress(progress_file);
     if (current < start || current > end) current = start;
@@ -263,10 +271,11 @@ void worker(uint32_t start, uint32_t end, int thread_id,
     FILE* fp = popen(cmd.c_str(), "w");
     if (!fp) {
         std::lock_guard<std::mutex> lock(cout_mutex);
-        std::cerr << "Thread " << thread_id << " failed to open brainflayer pipe" << std::endl;
+        std::cerr << "Thread " << thread_id << " failed to open brainflayer pipe: " << strerror(errno) << std::endl;
         return;
     }
 
+    uint64_t local_count = 0;
     for (uint32_t ts = current; ts <= end && !g_stop_flag; ++ts) {
         std::string mnemonic = generate_mnemonic_bip39(ts, wordlist);
         std::string privkey = mnemonic_to_private_key_hex(mnemonic);
@@ -274,20 +283,26 @@ void worker(uint32_t start, uint32_t end, int thread_id,
         fflush(fp);
 
         total_processed.fetch_add(1, std::memory_order_relaxed);
+        local_count++;
 
         if (ts % 100000 == 0 || ts == end) {
             save_progress(progress_file, ts + 1);
         }
 
-        if (ts % REPORT_INTERVAL == 0) {
+        if (ts % REPORT_INTERVAL == 0 && ts != 0) {
             std::lock_guard<std::mutex> lock(cout_mutex);
-            std::cout << "Thread " << thread_id << " reached timestamp " << ts << std::endl;
+            std::cout << "Thread " << thread_id << " reached timestamp " << ts << " (" << local_count << " keys)" << std::endl;
         }
     }
 
     pclose(fp);
     if (!g_stop_flag) {
         unlink(progress_file.c_str());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        std::cout << "Thread " << thread_id << " finished. Processed " << local_count << " keys." << std::endl;
     }
 }
 
@@ -319,16 +334,22 @@ int main() {
     std::cout << "Developed by z1ph1us (upgraded)" << std::endl;
     std::cout << "------------------------------------------------------------------------" << std::endl;
 
+    // Check for brainflayer and bloom filter
+    if (!file_exists("./brainflayer/brainflayer")) {
+        std::cerr << "Error: brainflayer executable not found at ./brainflayer/brainflayer" << std::endl;
+        std::cerr << "Please ensure brainflayer is compiled and placed in the correct directory." << std::endl;
+        return 1;
+    }
+    if (!file_exists("./040823BF.blf")) {
+        std::cerr << "Error: bloom filter file 040823BF.blf not found in current directory." << std::endl;
+        return 1;
+    }
+
     int wordlist_choice = select_wordlist();
     std::string wordlist_name = WORDLIST_FILES[wordlist_choice];
     std::string wordlist_base = get_filename_base(wordlist_name);
     std::cout << "Loading " << wordlist_name << " wordlist..." << std::endl;
     auto wordlist = load_wordlist(wordlist_name);
-
-    // Check if brainflayer bloom filter exists
-    if (!file_exists("./040823BF.blf")) {
-        std::cerr << "Warning: Bloom filter file ./040823BF.blf not found. Brainflayer may fail." << std::endl;
-    }
 
     std::cout << "Options:\n";
     std::cout << "1. Generate private key for a specific date/time (single).\n";
@@ -452,7 +473,6 @@ int main() {
         std::cout << "Generating and checking private keys for the full 32-bit Unix timestamp range." << std::endl;
         std::cout << "Using " << NUM_THREADS << " threads." << std::endl;
 
-        // Full range from 0 to 0xFFFFFFFF
         uint64_t total_full = 0x100000000ULL; // 2^32
         uint64_t chunk_size = total_full / NUM_THREADS;
         uint64_t remainder = total_full % NUM_THREADS;
@@ -464,17 +484,16 @@ int main() {
         for (int i = 0; i < NUM_THREADS; ++i) {
             uint32_t thread_start = i * chunk_size;
             uint32_t thread_end = (i + 1) * chunk_size - 1;
+            // Distribute remainder to first 'remainder' threads
             if (i < remainder) {
-                thread_end += 1; // distribute remainder
-                // adjust start for next threads? better to add to end of current
-                // simpler: add remainder to last thread, but we'll do sequentially
+                thread_end += 1;
             }
-            // For simplicity, we'll add remainder to the last thread
+            // For last thread, ensure it covers up to 0xFFFFFFFF
             if (i == NUM_THREADS - 1) {
-                thread_end += remainder;
+                thread_end = 0xFFFFFFFF;
             }
-            // Ensure thread_end does not exceed 0xFFFFFFFF
-            if (thread_end < thread_start) thread_end = 0xFFFFFFFF;
+            // Sanity check
+            if (thread_end < thread_start) thread_end = thread_start;
 
             threads.emplace_back(worker, thread_start, thread_end, i,
                                  std::ref(wordlist), std::ref(total_processed), std::ref(cout_mutex));
