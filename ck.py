@@ -7,6 +7,7 @@ end = 21
 out_file = "brainflayer_privkeys.txt"
 
 seen = set()
+total = 0
 
 with open(out_file, "w") as out:
     for i in range(start, end + 1):
@@ -28,5 +29,9 @@ with open(out_file, "w") as out:
                     if priv not in seen:
                         seen.add(priv)
                         out.write(priv + "\n")
+                        total += 1
 
-print(f"\n✅ Done. Total unique keys: {len(seen)}")
+                        # 🔥 tampilkan langsung di terminal
+                        print(f"[FOUND {total}] {priv}")
+
+print(f"\n✅ Done. Total unique keys: {total}")
