@@ -205,8 +205,10 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
                    std::mutex& print_mtx) {
     
     std::string output_filename = OUTPUT_FILE_PREFIX + std::to_string(thread_id) + ".txt";
-    // Redirect stderr to stdout to capture everything in one file if needed, usually brainflayer outputs hits to stdout
-    std::string cmd = "./brainflayer/brainflayer -v -b ./040823BF.blf -t priv -x > " + output_filename + " 2>&1";
+    
+    // [FIX 1] Hapus flag '-v' agar brainflayer silent. 
+    // Hapus '2>&1' agar error/stats tidak masuk ke file output kunci.
+    std::string cmd = "./brainflayer/brainflayer -b ./040823BF.blf -t priv -x > " + output_filename;
     
     FILE* pipe = popen(cmd.c_str(), "w");
     if (!pipe) {
@@ -216,9 +218,6 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
     }
 
     uint64_t local_processed = 0;
-    
-    // [UPGRADE 3] Incremental File Monitor via Stream Offset
-    // Menggunakan tellg() dan seekg() untuk memonitor hanya data baru
     std::streampos last_file_pos = 0;
     size_t local_found_count = 0;
     
@@ -232,62 +231,71 @@ void worker_thread(uint32_t start_ts, uint32_t end_ts, int thread_id,
         global_counter.fetch_add(1, std::memory_order_relaxed);
 
         if (local_processed % REPORT_INTERVAL == 0) {
-            // Check file secara efisien
             std::ifstream monitor(output_filename);
             if (monitor.is_open()) {
-                // Cek ukuran file saat ini
                 monitor.seekg(0, std::ios::end);
                 std::streampos current_pos = monitor.tellg();
 
-                // Jika file bertambah besar dari posisi terakhir kita membaca
                 if (current_pos > last_file_pos) {
-                    monitor.clear(); // Bersihkan flag EOF
-                    monitor.seekg(last_file_pos); // Lompat ke posisi terakhir
+                    monitor.clear(); 
+                    monitor.seekg(last_file_pos);
                     
                     std::string line;
                     size_t new_hits = 0;
                     while (std::getline(monitor, line)) {
-                        if(!line.empty()) new_hits++;
+                        // [FIX 2] Validasi Panjang String
+                        // Private key hex panjangnya 64 karakter.
+                        // Abaikan baris kosong atau pesan error pendek.
+                        // Kita trim dulu whitespace (just in case)
+                        line.erase(0, line.find_first_not_of(" \t\n\r"));
+                        line.erase(line.find_last_not_of(" \t\n\r") + 1);
+
+                        if(line.length() == 64) {
+                            new_hits++;
+                        }
                     }
                     
                     if (new_hits > 0) {
                         g_total_found_keys += new_hits;
                         local_found_count += new_hits;
                         std::lock_guard<std::mutex> lock(print_mtx);
-                        std::cout << "\n\033[1;32m[!!!] THREAD " << thread_id << " FOUND " << new_hits << " NEW KEYS!\033[0m" << std::endl;
+                        std::cout << "\n\033[1;32m[!!!] THREAD " << thread_id << " REALLY FOUND " << new_hits << " KEYS!\033[0m" << std::endl;
                     }
                     
-                    // Simpan posisi terakhir (sekarang di akhir file)
                     last_file_pos = monitor.tellg();
                 }
             }
             
+            // Print progress tanpa mengganggu visual
+            // (Opsional: comment bagian ini jika ingin output lebih bersih)
             std::lock_guard<std::mutex> lock(print_mtx);
             std::cout << "[Thread " << thread_id << "] TS: " << ts 
                       << " | Processed: " << local_processed 
-                      << " | Found (Local): " << local_found_count << std::endl;
+                      << " | Found: " << local_found_count << "\r" << std::flush;
         }
     }
 
     pclose(pipe);
     
-    // Final check untuk sisa output
+    // Final check
     {
         std::ifstream monitor(output_filename);
         if (monitor.is_open()) {
             monitor.seekg(last_file_pos);
             std::string line;
             size_t new_hits = 0;
-            while (std::getline(monitor, line)) { if(!line.empty()) new_hits++; }
+            while (std::getline(monitor, line)) { 
+                line.erase(0, line.find_first_not_of(" \t\n\r"));
+                line.erase(line.find_last_not_of(" \t\n\r") + 1);
+                if(line.length() == 64) new_hits++; 
+            }
             if (new_hits > 0) {
                 g_total_found_keys += new_hits;
                 local_found_count += new_hits;
+                std::lock_guard<std::mutex> lock(print_mtx);
+                std::cout << "\n[Thread " << thread_id << "] Final Check Found: " << new_hits << std::endl;
             }
         }
-        
-        std::lock_guard<std::mutex> lock(print_mtx);
-        std::cout << "[Thread " << thread_id << "] Finished. Total: " << local_processed 
-                  << " | Found: " << local_found_count << std::endl;
     }
 }
 
