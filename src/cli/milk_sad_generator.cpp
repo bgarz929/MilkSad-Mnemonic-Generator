@@ -38,7 +38,7 @@
 #include <cstring>
 
 // ================= CONFIG =================
-const std::string WORDLIST_FILE = "english.txt";
+const std::string WORDLIST_FILE = "./Wordlist/english.txt";
 const std::string OUTPUT_PREFIX = "found_legacy_keys_";
 const uint64_t REPORT_INTERVAL = 20000;
 const std::string BRAINFLAYER_BIN = "./brainflayer/brainflayer";
