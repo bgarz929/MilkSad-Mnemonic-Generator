@@ -36,7 +36,7 @@
 const std::string WORDLIST_DIR = "./Wordlist/";
 const std::string OUTPUT_FILE_PREFIX = "brainflayer_found_";
 const uint64_t REPORT_INTERVAL = 50000; // Report & Check file every N keys per thread
-const int DEFAULT_NUM_THREADS = 24; 
+const int DEFAULT_NUM_THREADS = 22; 
 
 // --- Global Flags & Counters ---
 std::atomic<bool> g_stop_flag(false);
