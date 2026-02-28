@@ -402,17 +402,23 @@ int main() {
     // --- Progress monitoring loop ---
     time_t start_time = time(nullptr);
     uint64_t last_processed = 0;
-
+    
     while (true) {
         sleep(2);
-
+    
+        // Reap zombie workers
+        for (pid_t pid : g_child_pids) {
+            int status;
+            waitpid(pid, &status, WNOHANG);
+        }
+    
         // Cek apakah semua worker masih hidup
         int alive = 0;
         for (pid_t pid : g_child_pids) {
             if (kill(pid, 0) == 0) alive++;
         }
         if (alive == 0) break; // Semua selesai
-
+    
         // Baca progress dari setiap worker
         uint64_t sum_processed = 0;
         for (pid_t pid : g_child_pids) {
@@ -426,23 +432,28 @@ int main() {
                 fclose(fp);
             }
         }
-
+    
         time_t now = time(nullptr);
         double elapsed = difftime(now, start_time);
         double percent = (double)sum_processed / total_timestamps * 100.0;
         double rate = (elapsed > 0) ? sum_processed / elapsed : 0;
         double eta = (rate > 0) ? (total_timestamps - sum_processed) / rate : 0;
-
+    
         printf("\rProgress: %llu/%llu (%.2f%%) | Rate: %.1f ts/s | Elapsed: %.0fs | ETA: %.0fs   ",
                (unsigned long long)sum_processed, (unsigned long long)total_timestamps,
                percent, rate, elapsed, eta);
         fflush(stdout);
-
+    
         last_processed = sum_processed;
     }
-
+    
     // Semua worker selesai, tunggu brainflayer (yang akan EOF karena pipe tertutup)
-    waitpid(g_brainflayer_pid, nullptr, 0);
+    int brain_status;
+    if (waitpid(g_brainflayer_pid, &brain_status, 0) == -1) {
+        if (errno != ECHILD) {
+            perror("waitpid brainflayer");
+        }
+    }
 
     // Hapus file progress
     for (pid_t pid : g_child_pids) {
