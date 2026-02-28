@@ -383,7 +383,8 @@ int main() {
     std::cout << "End Date   (YYYY-MM-DD): "; std::cin >> end_str;
 
     // [UPGRADE] UTC Parsing
-    struct tm tm_start = {0}, tm_end = {0};
+    struct tm tm_start{};
+    struct tm tm_end{};
     strptime((start_str + " 00:00:00").c_str(), "%Y-%m-%d %H:%M:%S", &tm_start);
     strptime((end_str + " 23:59:59").c_str(), "%Y-%m-%d %H:%M:%S", &tm_end);
     
