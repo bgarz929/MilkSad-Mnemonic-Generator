@@ -45,6 +45,7 @@ const std::string OUTPUT_PREFIX = "found_legacy_keys_";
 const uint64_t REPORT_INTERVAL = 20000;
 const std::string BRAINFLAYER_BIN = "./brainflayer/brainflayer";
 const std::string BLOOM_FILTER = "./040823BF.blm";
+const std::string TABFILE = "./tablefile.tab";
 const int ENTROPY_BYTES = 24;
 
 // ================= GLOBAL =================
@@ -367,7 +368,7 @@ int main() {
         // Exec brainflayer
         execlp(BRAINFLAYER_BIN.c_str(),
                BRAINFLAYER_BIN.c_str(),
-               "-v", "-b", BLOOM_FILTER.c_str(),
+               "-v", "-m", TABFILE.c_str(), "-b", BLOOM_FILTER.c_str(),
                "-t", "priv", "-x", NULL);
         perror("execlp brainflayer");
         exit(1);
