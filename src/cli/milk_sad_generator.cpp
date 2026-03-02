@@ -44,7 +44,7 @@ const std::string WORDLIST_FILE = "./Wordlist/english.txt";
 const std::string OUTPUT_PREFIX = "found_legacy_keys_";
 const uint64_t REPORT_INTERVAL = 20000;
 const std::string BRAINFLAYER_BIN = "./brainflayer/brainflayer";
-const std::string BLOOM_FILTER = "./040823BF.blf";
+const std::string BLOOM_FILTER = "./040823BF.blm";
 const int ENTROPY_BYTES = 24;
 
 // ================= GLOBAL =================
